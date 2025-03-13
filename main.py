@@ -31,8 +31,7 @@ CONFLUENCE_USERNAME = os.environ["CONFLUENCE_USERNAME"]
 CONFLUENCE_API_TOKEN = os.environ["CONFLUENCE_API_TOKEN"]
 SPACE_KEY = os.environ.get("CONFLUENCE_SPACE_KEY", None)  # Optional, can specify multiple spaces
 
-# Hardcode model for embeddings
-# msmarco-distilbert-base-v4: Better ranking for search.
+# Hardcode model for embeddings:
 model = SentenceTransformer("msmarco-distilbert-base-v4")
 
 # Initialize the Slack app
@@ -262,7 +261,10 @@ def initialize_knowledge_base():
 
 @app.event("app_mention")
 def handle_app_mentions(body, say):
-    """Handle app mentions in channels"""
+    """
+    Process messages where the bot is mentioned in channels.
+    (This listener is kept so that the bot can still be addressed in channels.)
+    """
     event = body["event"]
     text = event["text"]
 
@@ -280,25 +282,20 @@ def handle_app_mentions(body, say):
         return
 
     try:
-        # Check if knowledge base is initialized
         if len(document_chunks) == 0:
             say(text="Initializing knowledge base for the first time. This may take a few minutes...")
             initialize_knowledge_base()
             say(text="Knowledge base initialized! Now processing your question...")
 
-        # Search for relevant documents using top_k=3
         relevant_chunks = search_documents(question, top_k=3)
-
         if not relevant_chunks:
             say(text="I couldn't find any relevant information in the Confluence documents. Please try rephrasing your question.")
             return
 
-        # Extract answer and format it as bullet points
         answer = extract_answer(question, relevant_chunks)
         answer_sentences = sent_tokenize(answer)
         bullet_answer = "\n".join([f"- {sentence}" for sentence in answer_sentences])
 
-        # Build related wikis from unique sources
         seen_sources = {}
         for chunk in relevant_chunks:
             url = chunk['metadata'].get('url')
@@ -314,7 +311,6 @@ def handle_app_mentions(body, say):
         formatted_response += "*Answer:*\n" + bullet_answer + "\n\n"
         formatted_response += "*Related Wikis:*\n" + related_wikis.strip()
 
-        # Use helper to send response in chunks if it exceeds 4000 characters
         send_long_message_generic(say, text=formatted_response)
 
     except Exception as e:
@@ -323,148 +319,79 @@ def handle_app_mentions(body, say):
 
 @app.message("help")
 def help_message(message, say):
-    """Provide help information"""
+    """Provide help information in any channel or DM."""
     help_text = """
 *Confluence Knowledge Bot Help*
 
 I'm your secure, local Confluence knowledge assistant. I can help you find information from your Confluence workspace without sending your data to external services!
 
 *Commands:*
-• `@ConfluenceBot [your question]` - Ask me anything about your Confluence documents
-• `@ConfluenceBot refresh` - Refresh my knowledge base with the latest Confluence content
-• `help` - Show this help message
-
-*Examples:*
-• `@ConfluenceBot What is our return policy?`
-• `@ConfluenceBot Who is responsible for the marketing campaigns?`
-• `@ConfluenceBot When is the next product release?`
+• Send me a DM with your question about Confluence documents.
+• In channels, mention me with your question (e.g., `@ConfluenceBot What is our return policy?`).
+• Send `refresh` to update my knowledge base.
+• `help` - Show this help message.
     """
     say(text=help_text)
 
-@app.event("app_home_opened")
-def update_home_tab(client, event, logger):
-    """Publish a custom Home tab view when the App Home is opened."""
-    try:
-        client.views_publish(
-            user_id=event["user"],
-            view={
-                "type": "home",
-                "blocks": [
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": "Welcome to *Confluence Knowledge Bot*!\nI'm here to help you find information in your Confluence documents."
-                        }
-                    },
-                    {
-                        "type": "divider"
-                    },
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": "*Commands:*\n• `@ConfluenceBot [your question]` - Ask a question\n• `@ConfluenceBot refresh` - Refresh the knowledge base\n• `help` - Get help information"
-                        }
-                    },
-                    {
-                        "type": "actions",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "text": {"type": "plain_text", "text": "Ask a Question"},
-                                "action_id": "ask_question_button"
-                            }
-                        ]
-                    }
-                ]
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error publishing home tab: {e}")
+@app.event("message")
+def handle_dm_messages(body, say):
+    """
+    Process direct messages (DMs) sent to the bot.
+    This listener checks if the message is in a DM channel (channel_type "im") and handles it.
+    """
+    event = body.get("event", {})
+    if event.get("channel_type") != "im":
+        return  # Only process DMs here
 
-@app.action("ask_question_button")
-def handle_ask_question_button(ack, body, client, logger):
-    """Handle the Ask a Question button click by opening a modal."""
-    ack()
-    try:
-        trigger_id = body["trigger_id"]
-        client.views_open(
-            trigger_id=trigger_id,
-            view={
-                "type": "modal",
-                "callback_id": "question_modal",
-                "title": {"type": "plain_text", "text": "Ask a Question"},
-                "submit": {"type": "plain_text", "text": "Submit"},
-                "close": {"type": "plain_text", "text": "Cancel"},
-                "blocks": [
-                    {
-                        "type": "input",
-                        "block_id": "question_input",
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "question_value",
-                            "multiline": True,
-                            "placeholder": {"type": "plain_text", "text": "Type your question here..."}
-                        },
-                        "label": {"type": "plain_text", "text": "Your Question"}
-                    }
-                ]
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error opening modal: {e}")
+    question = event.get("text", "").strip()
 
-@app.view("question_modal")
-def handle_question_modal_submission(ack, body, client, logger):
-    """Handle modal submission from the Ask a Question modal."""
-    ack()
-    try:
-        # Extract the submitted question
-        submitted_data = body["view"]["state"]["values"]
-        question = submitted_data["question_input"]["question_value"]["value"]
+    if not question:
+        say(text="Please ask me a question about Confluence documents! 📚")
+        return
 
-        # Process the question using your existing functions
+    if question.lower() == "refresh":
+        say(text="Refreshing knowledge base from Confluence... This may take a few minutes.")
+        initialize_knowledge_base()
+        say(text="Knowledge base refreshed successfully! 🎉")
+        return
+
+    try:
         if len(document_chunks) == 0:
-            # If the knowledge base hasn't been initialized, initialize it
+            say(text="Initializing knowledge base for the first time. This may take a few minutes...")
             initialize_knowledge_base()
+            say(text="Knowledge base initialized! Now processing your question...")
 
         relevant_chunks = search_documents(question, top_k=3)
         if not relevant_chunks:
-            answer = "I couldn't find any relevant information. Please try a different question."
-            bullet_answer = f"- {answer}"
-            formatted_response = f"*Your Query:* {question}\n*Answer:*\n{bullet_answer}"
-        else:
-            answer = extract_answer(question, relevant_chunks)
-            answer_sentences = sent_tokenize(answer)
-            bullet_answer = "\n".join([f"- {sentence}" for sentence in answer_sentences])
+            say(text="I couldn't find any relevant information in the Confluence documents. Please try rephrasing your question.")
+            return
 
-            seen_sources = {}
-            for chunk in relevant_chunks:
-                url = chunk['metadata'].get('url')
-                title = chunk['metadata'].get('title')
-                if url and title and url not in seen_sources:
-                    seen_sources[url] = title
+        answer = extract_answer(question, relevant_chunks)
+        answer_sentences = sent_tokenize(answer)
+        bullet_answer = "\n".join([f"- {sentence}" for sentence in answer_sentences])
 
-            related_wikis = ""
-            for idx, (url, title) in enumerate(seen_sources.items()):
-                related_wikis += f"{idx+1}. [{title}]({url})\n"
+        seen_sources = {}
+        for chunk in relevant_chunks:
+            url = chunk['metadata'].get('url')
+            title = chunk['metadata'].get('title')
+            if url and title and url not in seen_sources:
+                seen_sources[url] = title
 
-            formatted_response = f"*Your Query:* {question}\n"
-            formatted_response += "*Answer:*\n" + bullet_answer + "\n\n"
-            formatted_response += "*Related Wikis:*\n" + related_wikis.strip()
+        related_wikis = ""
+        for idx, (url, title) in enumerate(seen_sources.items()):
+            related_wikis += f"{idx+1}. [{title}]({url})\n"
 
-        # Send the formatted response as a message to the user,
-        # splitting into multiple messages if necessary.
-        user_id = body["user"]["id"]
-        send_long_message_generic(client.chat_postMessage, channel=user_id, text=formatted_response)
+        formatted_response = f"*Your Query:* {question}\n"
+        formatted_response += "*Answer:*\n" + bullet_answer + "\n\n"
+        formatted_response += "*Related Wikis:*\n" + related_wikis.strip()
+
+        send_long_message_generic(say, text=formatted_response)
+
     except Exception as e:
-        logger.error(f"Error handling modal submission: {e}")
+        logger.error(f"Error processing DM question: {str(e)}")
+        say(text="Sorry, I encountered an error while processing your question. Please try again later.")
 
-# Initialize the app
+# Initialize the app and start it using Socket Mode
 if __name__ == "__main__":
-    # Initialize knowledge base on startup
     initialize_knowledge_base()
-
-    # Start the app
     SocketModeHandler(app, SLACK_APP_TOKEN).start()
