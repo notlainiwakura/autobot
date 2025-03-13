@@ -31,6 +31,10 @@ CONFLUENCE_USERNAME = os.environ["CONFLUENCE_USERNAME"]
 CONFLUENCE_API_TOKEN = os.environ["CONFLUENCE_API_TOKEN"]
 SPACE_KEY = os.environ.get("CONFLUENCE_SPACE_KEY", None)  # Optional, can specify multiple spaces
 
+# Hardcode model for embeddings
+# msmarco-distilbert-base-v4: Better ranking for search.
+model = SentenceTransformer("msmarco-distilbert-base-v4")
+
 # Initialize the Slack app
 app = App(token=SLACK_BOT_TOKEN)
 
@@ -46,21 +50,46 @@ html_converter = html2text.HTML2Text()
 html_converter.ignore_links = False
 html_converter.ignore_images = True
 
-# Load the sentence transformer model
-model = SentenceTransformer('all-MiniLM-L6-v2')
-
 # Storage for document chunks and embeddings
 document_chunks = []
 chunk_embeddings = []
 document_metadata = []
 
+def send_long_message_generic(send_func, **kwargs):
+    """
+    Helper function to send messages that may exceed Slack's 4000 character limit.
+    Splits the text on newline boundaries and sends multiple messages.
+    """
+    text = kwargs.get("text", "")
+    max_chars = 4000
+    if len(text) <= max_chars:
+        send_func(**kwargs)
+    else:
+        lines = text.split("\n")
+        current_chunk = ""
+        for line in lines:
+            # +1 accounts for the newline character
+            if len(current_chunk) + len(line) + 1 > max_chars:
+                new_kwargs = kwargs.copy()
+                new_kwargs["text"] = current_chunk
+                send_func(**new_kwargs)
+                current_chunk = line
+            else:
+                if current_chunk:
+                    current_chunk += "\n" + line
+                else:
+                    current_chunk = line
+        if current_chunk:
+            new_kwargs = kwargs.copy()
+            new_kwargs["text"] = current_chunk
+            send_func(**new_kwargs)
 
 def fetch_confluence_content():
     """Fetch content from Confluence and prepare it for chunking"""
     all_pages = []
 
     if SPACE_KEY:
-        # If specific space is provided, get pages from that space
+        # If a specific space is provided, get pages from that space
         space_keys = [s.strip() for s in SPACE_KEY.split(',')]
         for space in space_keys:
             logger.info(f"Fetching pages from space: {space}")
@@ -100,9 +129,12 @@ def fetch_confluence_content():
 
     return documents
 
-
-def chunk_documents(documents, chunk_size=500, overlap=100):
-    """Split documents into overlapping chunks"""
+def chunk_documents(documents, chunk_size=512, overlap=128):
+    """
+    Split documents into overlapping chunks.
+    Note: This implementation uses sentence boundaries and counts characters.
+    For true token counts, integrate a tokenizer that returns token lengths.
+    """
     global document_chunks, document_metadata
 
     document_chunks = []
@@ -119,9 +151,8 @@ def chunk_documents(documents, chunk_size=500, overlap=100):
             sentence_length = len(sentence)
 
             # If adding this sentence exceeds chunk size and we have content,
-            # save current chunk and start a new one with overlap
+            # save current chunk and start a new one with overlap.
             if current_length + sentence_length > chunk_size and current_chunk:
-                # Save the current chunk
                 chunk_text = ' '.join(current_chunk)
                 document_chunks.append(chunk_text)
                 document_metadata.append(doc['metadata'])
@@ -154,7 +185,6 @@ def chunk_documents(documents, chunk_size=500, overlap=100):
     logger.info(f"Created {len(document_chunks)} chunks from {len(documents)} documents")
     return document_chunks, document_metadata
 
-
 def create_embeddings():
     """Create embeddings for all document chunks"""
     global chunk_embeddings
@@ -163,9 +193,11 @@ def create_embeddings():
     chunk_embeddings = model.encode(document_chunks)
     logger.info(f"Created {len(chunk_embeddings)} embeddings")
 
-
-def search_documents(query, top_k=1):
-    """Search for the most relevant document chunks"""
+def search_documents(query, top_k=3):
+    """
+    Search for the most relevant document chunks.
+    Default top_k is set to 3; you can adjust dynamically if needed.
+    """
     # Encode the query
     query_embedding = model.encode([query])[0]
 
@@ -185,9 +217,11 @@ def search_documents(query, top_k=1):
 
     return results
 
-
 def extract_answer(query, relevant_chunks, max_length=40000):
-    """Extract a simple answer from relevant chunks"""
+    """
+    Extract a simple answer from relevant chunks.
+    Combines chunks and selects sentences most similar to the query.
+    """
     # Combine chunks, starting with the most relevant
     combined_text = ' '.join([chunk['chunk'] for chunk in relevant_chunks])
 
@@ -218,15 +252,13 @@ def extract_answer(query, relevant_chunks, max_length=40000):
 
     return answer.strip()
 
-
 def initialize_knowledge_base():
     """Initialize the knowledge base from Confluence"""
     logger.info("Initializing knowledge base from Confluence...")
     documents = fetch_confluence_content()
-    chunk_documents(documents)
+    chunk_documents(documents)  # Uses default chunk_size=512 and overlap=128
     create_embeddings()
     logger.info("Knowledge base initialized successfully!")
-
 
 @app.event("app_mention")
 def handle_app_mentions(body, say):
@@ -238,51 +270,56 @@ def handle_app_mentions(body, say):
     question = re.sub(r'<@[A-Z0-9]+>\s*', '', text).strip()
 
     if not question:
-        say("Please ask me a question about Confluence documents! 📚")
+        say(text="Please ask me a question about Confluence documents! 📚")
         return
 
     if question.lower() == "refresh":
-        say("Refreshing knowledge base from Confluence... This may take a few minutes.")
+        say(text="Refreshing knowledge base from Confluence... This may take a few minutes.")
         initialize_knowledge_base()
-        say("Knowledge base refreshed successfully! 🎉")
+        say(text="Knowledge base refreshed successfully! 🎉")
         return
 
     try:
         # Check if knowledge base is initialized
         if len(document_chunks) == 0:
-            say("Initializing knowledge base for the first time. This may take a few minutes...")
+            say(text="Initializing knowledge base for the first time. This may take a few minutes...")
             initialize_knowledge_base()
-            say("Knowledge base initialized! Now processing your question...")
+            say(text="Knowledge base initialized! Now processing your question...")
 
-        # Search for relevant documents
+        # Search for relevant documents using top_k=3
         relevant_chunks = search_documents(question, top_k=3)
 
         if not relevant_chunks:
-            say("I couldn't find any relevant information in the Confluence documents. Please try rephrasing your question.")
+            say(text="I couldn't find any relevant information in the Confluence documents. Please try rephrasing your question.")
             return
 
-        # Extract answer
+        # Extract answer and format it as bullet points
         answer = extract_answer(question, relevant_chunks)
+        answer_sentences = sent_tokenize(answer)
+        bullet_answer = "\n".join([f"- {sentence}" for sentence in answer_sentences])
 
-        # Format the response with sources
-        formatted_response = f"*Answer:*\n{answer}\n\n*Sources:*"
-
-        # Add unique sources
-        seen_urls = set()
+        # Build related wikis from unique sources
+        seen_sources = {}
         for chunk in relevant_chunks:
             url = chunk['metadata'].get('url')
             title = chunk['metadata'].get('title')
+            if url and title and url not in seen_sources:
+                seen_sources[url] = title
 
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                formatted_response += f"\n• <{url}|{title}>"
+        related_wikis = ""
+        for idx, (url, title) in enumerate(seen_sources.items()):
+            related_wikis += f"{idx+1}. [{title}]({url})\n"
 
-        say(formatted_response)
+        formatted_response = f"*Your Query:* {question}\n"
+        formatted_response += "*Answer:*\n" + bullet_answer + "\n\n"
+        formatted_response += "*Related Wikis:*\n" + related_wikis.strip()
+
+        # Use helper to send response in chunks if it exceeds 4000 characters
+        send_long_message_generic(say, text=formatted_response)
 
     except Exception as e:
         logger.error(f"Error processing question: {str(e)}")
-        say("Sorry, I encountered an error while processing your question. Please try again later.")
-
+        say(text="Sorry, I encountered an error while processing your question. Please try again later.")
 
 @app.message("help")
 def help_message(message, say):
@@ -302,8 +339,7 @@ I'm your secure, local Confluence knowledge assistant. I can help you find infor
 • `@ConfluenceBot Who is responsible for the marketing campaigns?`
 • `@ConfluenceBot When is the next product release?`
     """
-    say(help_text)
-
+    say(text=help_text)
 
 @app.event("app_home_opened")
 def update_home_tab(client, event, logger):
@@ -347,7 +383,6 @@ def update_home_tab(client, event, logger):
     except Exception as e:
         logger.error(f"Error publishing home tab: {e}")
 
-
 @app.action("ask_question_button")
 def handle_ask_question_button(ack, body, client, logger):
     """Handle the Ask a Question button click by opening a modal."""
@@ -380,7 +415,6 @@ def handle_ask_question_button(ack, body, client, logger):
     except Exception as e:
         logger.error(f"Error opening modal: {e}")
 
-
 @app.view("question_modal")
 def handle_question_modal_submission(ack, body, client, logger):
     """Handle modal submission from the Ask a Question modal."""
@@ -398,18 +432,34 @@ def handle_question_modal_submission(ack, body, client, logger):
         relevant_chunks = search_documents(question, top_k=3)
         if not relevant_chunks:
             answer = "I couldn't find any relevant information. Please try a different question."
+            bullet_answer = f"- {answer}"
+            formatted_response = f"*Your Query:* {question}\n*Answer:*\n{bullet_answer}"
         else:
             answer = extract_answer(question, relevant_chunks)
+            answer_sentences = sent_tokenize(answer)
+            bullet_answer = "\n".join([f"- {sentence}" for sentence in answer_sentences])
 
-        # Send the answer as a message to the user (you can also update the Home tab if desired)
+            seen_sources = {}
+            for chunk in relevant_chunks:
+                url = chunk['metadata'].get('url')
+                title = chunk['metadata'].get('title')
+                if url and title and url not in seen_sources:
+                    seen_sources[url] = title
+
+            related_wikis = ""
+            for idx, (url, title) in enumerate(seen_sources.items()):
+                related_wikis += f"{idx+1}. [{title}]({url})\n"
+
+            formatted_response = f"*Your Query:* {question}\n"
+            formatted_response += "*Answer:*\n" + bullet_answer + "\n\n"
+            formatted_response += "*Related Wikis:*\n" + related_wikis.strip()
+
+        # Send the formatted response as a message to the user,
+        # splitting into multiple messages if necessary.
         user_id = body["user"]["id"]
-        client.chat_postMessage(
-            channel=user_id,
-            text=f"*Answer:*\n{answer}"
-        )
+        send_long_message_generic(client.chat_postMessage, channel=user_id, text=formatted_response)
     except Exception as e:
         logger.error(f"Error handling modal submission: {e}")
-
 
 # Initialize the app
 if __name__ == "__main__":
