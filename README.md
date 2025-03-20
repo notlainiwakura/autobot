@@ -1,17 +1,157 @@
-# Autobot
+# Improved Confluence Knowledge Bot
 
-Autobot is a Slack application that connects to PLQA workspace, fetches and processes Confluence pages, and allows users to ask questions about the content directly from Slack. It leverages semantic search using sentence embeddings to provide contextually relevant answers.
+A Slack bot that connects to your Confluence workspace and uses advanced retrieval techniques to answer questions about your documentation. The bot runs entirely within your infrastructure, keeping your data secure and private.
 
 ## Features
 
-- **Confluence Integration:**  
-  Retrieves pages from specified Confluence spaces and extracts plain text from HTML content.
+### AI-Enhanced Responses
+- **Vertex AI Integration**: Optional integration with Google Vertex AI for more coherent, context-aware responses
+- **LangChain Framework**: Uses LangChain for advanced document processing and generation
+- **Fallback Mechanisms**: Gracefully degrades to basic extraction if AI services are unavailable
 
-- **Document Processing & Chunking:**  
-  Splits Confluence content into manageable, overlapping chunks to maintain context and improve search relevance.
+### Core Capabilities
+- **Semantic Search**: Uses advanced embedding models to understand the meaning of questions, not just keywords
+- **Intelligent Context Awareness**: Organizes related content from multiple documents to provide comprehensive answers
+- **Smart Chunking**: Splits documents into meaningful segments while preserving context for better retrieval
+- **Token-Based Processing**: Uses tiktoken for accurate token counting, ensuring optimal chunk sizes
 
-- **Semantic Search:**  
-  Uses the `all-MiniLM-L6-v2` SentenceTransformer model to generate embeddings and perform fast, efficient semantic similarity searches.
+### Performance Enhancements
+- **Persistent Caching**: Saves processed documents and embeddings to disk for faster startup
+- **Automatic Refreshes**: Periodically updates the knowledge base in the background
+- **Parallel Processing**: Uses multithreading to speed up document processing
+- **Graceful Shutdowns**: Preserves state to recover quickly after restarts
 
-- **Slack Bot Interaction:**  
-  Responds to app mentions and interactive messages.
+### User Experience Improvements
+- **Improved Message Formatting**: Better structured responses with clear source citations
+- **Smart Message Splitting**: Handles long responses by splitting on natural sentence boundaries
+- **Thread Management**: Prevents overlapping requests that could cause confusion
+- **Typing Indicators**: Shows when the bot is processing a question
+- **Home Tab**: Provides usage information and status directly in Slack
+- **Admin Controls**: Allows workspace admins to refresh the knowledge base
+
+## Setup Instructions
+
+### Requirements
+- Python 3.8+
+- Slack App with Bot Token and Socket Mode enabled
+- Confluence API access
+
+### Environment Variables
+Create a `.env` file with the following variables:
+
+```
+# Slack Credentials
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_APP_TOKEN=xapp-your-app-token
+
+# Confluence Credentials
+CONFLUENCE_URL=https://your-workspace.atlassian.net/wiki
+CONFLUENCE_USERNAME=your-email@example.com
+CONFLUENCE_API_TOKEN=your-api-token
+CONFLUENCE_SPACE_KEY=SPACE1,SPACE2  # Optional, comma-separated list of spaces to index
+
+# Bot Configuration
+CACHE_DIR=cache  # Directory for caching (will be created if it doesn't exist)
+REFRESH_INTERVAL_HOURS=24  # How often to refresh the knowledge base
+MAX_WORKERS=4  # Number of worker threads for parallel processing
+CHUNK_SIZE=512  # Size of document chunks (in tokens)
+CHUNK_OVERLAP=128  # Overlap between chunks (in tokens)
+TOP_K_RESULTS=5  # Number of results to return per query
+EMBEDDING_MODEL=msmarco-distilbert-base-v4  # Model to use for embeddings
+
+# Optional Vertex AI Integration
+USE_VERTEX_AI=false  # Set to true to enable Vertex AI integration
+GCP_PROJECT_ID=your-gcp-project-id  # Your Google Cloud project ID
+GCP_LOCATION=us-central1  # Google Cloud region
+VERTEX_MODEL=gemini-1.5-pro  # Vertex AI model to use
+LANGCHAIN_CACHE_DIR=langchain_cache  # Directory for LangChain cache
+```
+
+### Installation
+1. Clone this repository
+2. Create a virtual environment: `python -m venv venv`
+3. Activate the virtual environment:
+   - Windows: `venv\Scripts\activate`
+   - macOS/Linux: `source venv/bin/activate`
+4. Install dependencies: `pip install -r requirements.txt`
+5. Create your `.env` file with the required credentials
+6. Run the bot: `python bot.py`
+
+### Slack App Permissions
+
+Your Slack app needs the following scopes:
+- `app_mentions:read` - To receive mentions in channels
+- `chat:write` - To send messages
+- `im:history` - To read direct messages
+- `im:read` - To read direct message events
+- `im:write` - To send direct messages
+- `reactions:write` - (Optional) To show typing indicators via reactions
+
+### Required Packages
+```
+slack-bolt
+atlassian-python-api
+html2text
+sentence-transformers
+scikit-learn
+nltk
+python-dotenv
+numpy
+tiktoken
+```
+
+### Optional Packages (for Vertex AI integration)
+```
+google-cloud-aiplatform
+langchain
+langchain-google-vertexai
+faiss-cpu
+```
+
+## Usage
+
+### Basic Commands
+- **Ask a question**: Mention the bot in a channel or send a direct message with your question
+- **Get help**: Send `help` to the bot
+- **Refresh the knowledge base**: Send `refresh` to the bot (admin only)
+
+### Tips for Good Questions
+- Be specific in your questions
+- Include keywords that might appear in the documents
+- If you don't get a good answer, try rephrasing your question
+
+## Key Improvements Over Original Version
+
+1. **Token-Based Chunking**: Now uses accurate token counting for better context management
+2. **Enhanced Answer Generation**: Groups content by document for more coherent answers
+3. **Smarter Message Handling**: Better splitting of long messages to maintain readability
+4. **Caching System**: Persistent storage of processed documents and embeddings
+5. **Background Refreshes**: Automatically updates the knowledge base at configurable intervals
+6. **Parallel Processing**: Faster document processing with multithreading
+7. **More Detailed Metadata**: Captures and displays richer information about sources
+8. **Thread Safety**: Properly handles concurrent requests
+9. **Graceful Recovery**: Better handling of shutdowns and restarts
+10. **Home Tab Interface**: Added Slack home tab for improved user experience
+11. **Enhanced Error Handling**: More robust error management throughout
+12. **Typing Indicators**: Visual feedback when processing requests
+13. **User Permission Controls**: Admin-only refresh feature
+14. **Configurable Parameters**: More options to tune performance
+
+## Architecture
+
+The bot follows a Retrieval-Augmented Generation (RAG) approach:
+
+1. **Indexing Phase**:
+   - Fetches all pages from Confluence
+   - Splits content into semantically meaningful chunks
+   - Creates vector embeddings for each chunk
+   - Stores chunks, embeddings, and metadata in memory and on disk
+
+2. **Query Phase**:
+   - Converts user question to a vector embedding
+   - Finds the most similar document chunks
+   - Extracts relevant sentences from these chunks
+   - Organizes information by source document
+   - Formats a coherent response with citations
+
+This approach ensures that answers are directly grounded in your Confluence content, avoiding hallucination and providing transparent source citations.
