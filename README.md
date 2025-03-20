@@ -137,7 +137,9 @@ The bot follows a Retrieval-Augmented Generation (RAG) approach:
    - Organizes information by source document
    - Formats a coherent response with citations
 
-This approach ensures that answers are directly grounded in our Confluence content, avoiding hallucination and providing transparent source citations.
+
+
+
 -----------------
 SAMPLE .env FILE
 -----------------
