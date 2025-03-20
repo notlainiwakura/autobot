@@ -143,17 +143,17 @@ The bot follows a Retrieval-Augmented Generation (RAG) approach:
 -----------------
 SAMPLE .env FILE
 -----------------
-# Slack Credentials
+Slack Credentials
 SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_APP_TOKEN=xapp-your-app-token
 
-# Confluence Credentials
+Confluence Credentials
 CONFLUENCE_URL=https://your-workspace.atlassian.net/wiki
 CONFLUENCE_USERNAME=your-email@example.com
 CONFLUENCE_API_TOKEN=your-api-token
 CONFLUENCE_SPACE_KEY=SPACE1,SPACE2  # Optional, comma-separated list of spaces to index
 
-# Bot Configuration
+Bot Configuration
 CACHE_DIR=cache
 REFRESH_INTERVAL_HOURS=24
 MAX_WORKERS=4
@@ -162,7 +162,7 @@ CHUNK_OVERLAP=128
 TOP_K_RESULTS=5
 EMBEDDING_MODEL=msmarco-distilbert-base-v4
 
-# Vertex AI Integration (Optional)
+Vertex AI Integration (Optional)
 USE_VERTEX_AI=true  # Set to false to disable Vertex AI
 GCP_PROJECT_ID=your-gcp-project-id
 GCP_LOCATION=us-central1
