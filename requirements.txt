@@ -7,10 +7,7 @@ nltk>=3.8.1
 python-dotenv>=1.0.0
 numpy>=1.24.3
 tiktoken>=0.5.1
-
-# Optional: Vertex AI integration dependencies
-# Uncomment these if you want to use the Vertex AI integration
-# google-cloud-aiplatform>=1.28.0
-# langchain>=0.0.266
-# langchain-google-vertexai>=0.0.1
-# faiss-cpu>=1.7.4
+google-cloud-aiplatform>=1.28.0
+langchain>=0.0.266
+langchain-google-vertexai>=0.0.1
+faiss-cpu>=1.7.4
