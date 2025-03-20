@@ -1,6 +1,10 @@
 import re
 import logging
 import numpy as np
+import pickle
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from atlassian import Confluence
@@ -11,16 +15,27 @@ from nltk.tokenize import sent_tokenize
 import os
 from dotenv import load_dotenv
 import nltk
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import json
+import tiktoken
+from typing import List, Dict, Any, Tuple, Optional
 
 # Download NLTK data for tokenization
-nltk.download('punkt_tab')
 nltk.download('punkt', quiet=True)
 
 # Load variables from .env file
 load_dotenv()
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Set up logging with more detailed format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("confluence_bot.log"),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Environment variables
@@ -30,9 +45,22 @@ CONFLUENCE_URL = os.environ["CONFLUENCE_URL"]
 CONFLUENCE_USERNAME = os.environ["CONFLUENCE_USERNAME"]
 CONFLUENCE_API_TOKEN = os.environ["CONFLUENCE_API_TOKEN"]
 SPACE_KEY = os.environ.get("CONFLUENCE_SPACE_KEY", None)  # Optional, can specify multiple spaces
+CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
+REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL_HOURS", 24))  # Default refresh every 24 hours
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))  # Thread pool size for parallel processing
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 512))   # Default chunk size
+CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 128))  # Default chunk overlap
+TOP_K_RESULTS = int(os.environ.get("TOP_K_RESULTS", 5))  # Default number of results to return
+
+# Create cache directory if it doesn't exist
+Path(CACHE_DIR).mkdir(exist_ok=True)
 
 # Hardcode model for embeddings:
-model = SentenceTransformer("msmarco-distilbert-base-v4")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "msmarco-distilbert-base-v4")
+model = SentenceTransformer(EMBEDDING_MODEL)
+
+# Initialize tokenizer for token counting (used for chunking)
+tokenizer = tiktoken.get_encoding("cl100k_base")
 
 # Initialize the Slack app
 app = App(token=SLACK_BOT_TOKEN)
@@ -41,281 +69,677 @@ app = App(token=SLACK_BOT_TOKEN)
 confluence = Confluence(
     url=CONFLUENCE_URL,
     username=CONFLUENCE_USERNAME,
-    password=CONFLUENCE_API_TOKEN
+    password=CONFLUENCE_API_TOKEN,
+    timeout=60  # Increased timeout for larger Confluence instances
 )
 
 # Initialize HTML to text converter
 html_converter = html2text.HTML2Text()
 html_converter.ignore_links = False
 html_converter.ignore_images = True
+html_converter.body_width = 0  # Don't wrap text at a specific width
 
 # Storage for document chunks and embeddings
 document_chunks = []
 chunk_embeddings = []
 document_metadata = []
+knowledge_base_lock = threading.Lock()  # Thread safety for knowledge base access
+last_refresh_time = None
+auto_refresh_thread = None
+refresh_event = threading.Event()
 
-def send_long_message_generic(send_func, **kwargs):
-    """
-    Helper function to send messages that may exceed Slack's 4000 character limit.
-    Splits the text on newline boundaries and sends multiple messages.
-    """
-    text = kwargs.get("text", "")
-    max_chars = 4000
-    if len(text) <= max_chars:
-        send_func(**kwargs)
-    else:
-        lines = text.split("\n")
-        current_chunk = ""
-        for line in lines:
-            # +1 accounts for the newline character
-            if len(current_chunk) + len(line) + 1 > max_chars:
-                new_kwargs = kwargs.copy()
-                new_kwargs["text"] = current_chunk
-                send_func(**new_kwargs)
-                current_chunk = line
+# Mapping of Slack channel IDs to in-progress threads
+active_threads = {}
+active_threads_lock = threading.Lock()
+
+class ConfluenceCache:
+    """Class to handle caching of Confluence content and embeddings"""
+    
+    @staticmethod
+    def get_cache_path(cache_type):
+        """Get the path to a specific cache file"""
+        return os.path.join(CACHE_DIR, f"{cache_type}.pkl")
+    
+    @staticmethod
+    def save_to_cache(data, cache_type):
+        """Save data to cache file"""
+        try:
+            with open(ConfluenceCache.get_cache_path(cache_type), 'wb') as f:
+                pickle.dump(data, f)
+            logger.info(f"Saved {cache_type} to cache")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving {cache_type} to cache: {str(e)}")
+            return False
+    
+    @staticmethod
+    def load_from_cache(cache_type):
+        """Load data from cache file"""
+        try:
+            cache_path = ConfluenceCache.get_cache_path(cache_type)
+            if os.path.exists(cache_path):
+                with open(cache_path, 'rb') as f:
+                    data = pickle.load(f)
+                logger.info(f"Loaded {cache_type} from cache")
+                return data
             else:
-                if current_chunk:
-                    current_chunk += "\n" + line
-                else:
-                    current_chunk = line
-        if current_chunk:
-            new_kwargs = kwargs.copy()
-            new_kwargs["text"] = current_chunk
-            send_func(**new_kwargs)
+                logger.info(f"No cache file found for {cache_type}")
+                return None
+        except Exception as e:
+            logger.error(f"Error loading {cache_type} from cache: {str(e)}")
+            return None
+    
+    @staticmethod
+    def is_cache_valid():
+        """Check if cache exists and is not too old"""
+        try:
+            metadata_path = ConfluenceCache.get_cache_path("metadata")
+            if not os.path.exists(metadata_path):
+                return False
+                
+            # Check when the cache was last modified
+            mtime = os.path.getmtime(metadata_path)
+            cache_time = datetime.fromtimestamp(mtime)
+            now = datetime.now()
+            
+            # If cache is older than refresh interval, it's invalid
+            return (now - cache_time) < timedelta(hours=REFRESH_INTERVAL)
+        except Exception as e:
+            logger.error(f"Error checking cache validity: {str(e)}")
+            return False
+
+def count_tokens(text):
+    """Count the number of tokens in a text using tiktoken"""
+    return len(tokenizer.encode(text))
+
+def send_long_message(say, text, thread_ts=None, blocks=None):
+    """
+    Send messages that may exceed Slack's character limit by splitting intelligently.
+    Uses blocks when available for better formatting.
+    """
+    max_chars = 3000  # Setting a bit lower than the 4000 limit to be safe
+    
+    # If message is short enough, send it directly
+    if len(text) <= max_chars:
+        say(text=text, thread_ts=thread_ts, blocks=blocks)
+        return
+    
+    # If we have blocks, we need a different approach
+    if blocks:
+        # First send just the text portion in chunks
+        send_long_message(say, text, thread_ts)
+        
+        # Then send blocks in separate messages if needed
+        for i in range(0, len(blocks), 50):  # Slack has a limit of 50 blocks per message
+            block_subset = blocks[i:i+50]
+            say(text="", thread_ts=thread_ts, blocks=block_subset)
+        return
+        
+    # Split on sentence boundaries for more natural breaks
+    sentences = sent_tokenize(text)
+    
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) + 1 > max_chars:
+            # Current chunk would be too large, store it and start a new one
+            chunks.append(current_chunk)
+            current_chunk = sentence
+        else:
+            # Add to current chunk with a space if not empty
+            if current_chunk:
+                current_chunk += " " + sentence
+            else:
+                current_chunk = sentence
+    
+    # Don't forget the last chunk
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    # Send each chunk in order
+    for i, chunk in enumerate(chunks):
+        # Add continuation indicator for multi-part messages
+        if len(chunks) > 1:
+            if i == 0:
+                chunk += "\n\n_(message continued in thread...)_"
+            else:
+                chunk = f"_(part {i+1}/{len(chunks)})_\n\n" + chunk
+        
+        say(text=chunk, thread_ts=thread_ts)
 
 def fetch_confluence_content():
     """Fetch content from Confluence and prepare it for chunking"""
     all_pages = []
 
     if SPACE_KEY:
-        # If a specific space is provided, get pages from that space
+        # If specific spaces are provided, get pages from those spaces
         space_keys = [s.strip() for s in SPACE_KEY.split(',')]
         for space in space_keys:
             logger.info(f"Fetching pages from space: {space}")
-            space_pages = confluence.get_all_pages_from_space(space, limit=100)
-            all_pages.extend(space_pages)
+            try:
+                space_pages = confluence.get_all_pages_from_space(space, limit=500, expand="body.storage")
+                logger.info(f"Fetched {len(space_pages)} pages from space {space}")
+                all_pages.extend(space_pages)
+            except Exception as e:
+                logger.error(f"Error fetching pages from space {space}: {str(e)}")
     else:
         # Otherwise, get all pages from all spaces
-        logger.info("Fetching all pages from all spaces")
-        all_spaces = confluence.get_all_spaces()
-        for space in all_spaces:
-            space_pages = confluence.get_all_pages_from_space(space['key'])
-            all_pages.extend(space_pages)
+        logger.info("Fetching all spaces")
+        try:
+            all_spaces = confluence.get_all_spaces()
+            logger.info(f"Found {len(all_spaces)} spaces")
+            
+            for space in all_spaces:
+                try:
+                    logger.info(f"Fetching pages from space: {space['key']}")
+                    space_pages = confluence.get_all_pages_from_space(space['key'], limit=500)
+                    logger.info(f"Fetched {len(space_pages)} pages from space {space['key']}")
+                    all_pages.extend(space_pages)
+                except Exception as e:
+                    logger.error(f"Error fetching pages from space {space['key']}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error fetching all spaces: {str(e)}")
 
     logger.info(f"Total pages fetched: {len(all_pages)}")
 
+    # Process pages in parallel
     documents = []
-    for page in all_pages:
-        try:
-            # Get page content
-            page_content = confluence.get_page_by_id(page['id'], expand='body.storage')
-            html_content = page_content['body']['storage']['value']
-            text_content = html_converter.handle(html_content)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all page processing tasks
+        future_to_page = {executor.submit(process_page, page): page for page in all_pages}
+        
+        # Collect results as they complete
+        for future in future_to_page:
+            try:
+                doc = future.result()
+                if doc:
+                    documents.append(doc)
+            except Exception as e:
+                logger.error(f"Error processing page: {str(e)}")
 
-            # Create document with metadata
-            doc = {
-                'content': text_content,
-                'metadata': {
-                    'title': page['title'],
-                    'id': page['id'],
-                    'url': f"{CONFLUENCE_URL}/pages/viewpage.action?pageId={page['id']}",
-                    'space': page.get('space', {}).get('name', 'Unknown')
-                }
-            }
-            documents.append(doc)
-        except Exception as e:
-            logger.error(f"Error processing page {page.get('title', 'Unknown')}: {str(e)}")
-
+    logger.info(f"Successfully processed {len(documents)} pages")
     return documents
 
-def chunk_documents(documents, chunk_size=512, overlap=128):
+def process_page(page):
+    """Process a single Confluence page and return a document"""
+    try:
+        # Get the page ID
+        page_id = page['id']
+        
+        # Get page content with expanded body
+        page_content = confluence.get_page_by_id(page_id, expand='body.storage,version,history,metadata.labels')
+        
+        # Extract HTML content
+        html_content = page_content['body']['storage']['value']
+        
+        # Convert HTML to text
+        text_content = html_converter.handle(html_content)
+        
+        # Extract labels if available
+        labels = []
+        if 'metadata' in page_content and 'labels' in page_content['metadata']:
+            for label in page_content['metadata']['labels'].get('results', []):
+                labels.append(label.get('name', ''))
+        
+        # Get last updated info
+        updated_date = page_content.get('version', {}).get('when', '')
+        last_updater = page_content.get('version', {}).get('by', {}).get('displayName', 'Unknown')
+        
+        # Create document with enhanced metadata
+        doc = {
+            'content': text_content,
+            'metadata': {
+                'title': page.get('title', 'Untitled'),
+                'id': page_id,
+                'url': f"{CONFLUENCE_URL}/pages/viewpage.action?pageId={page_id}",
+                'space': page.get('space', {}).get('name', 'Unknown'),
+                'space_key': page.get('space', {}).get('key', 'Unknown'),
+                'labels': labels,
+                'last_updated': updated_date,
+                'last_updater': last_updater
+            }
+        }
+        return doc
+    except Exception as e:
+        logger.error(f"Error processing page {page.get('title', 'Unknown')}: {str(e)}")
+        return None
+
+def chunk_documents(documents, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     """
-    Split documents into overlapping chunks.
-    Note: This implementation uses sentence boundaries and counts characters.
-    For true token counts, integrate a tokenizer that returns token lengths.
+    Split documents into overlapping chunks using token-based approach
+    with sentence boundaries preserved.
     """
     global document_chunks, document_metadata
-
+    
     document_chunks = []
     document_metadata = []
-
+    
     for doc in documents:
         # Split content into sentences
         sentences = sent_tokenize(doc['content'])
-
-        current_chunk = []
-        current_length = 0
-
-        for sentence in sentences:
-            sentence_length = len(sentence)
-
-            # If adding this sentence exceeds chunk size and we have content,
-            # save current chunk and start a new one with overlap.
-            if current_length + sentence_length > chunk_size and current_chunk:
-                chunk_text = ' '.join(current_chunk)
+        
+        # Get token counts for each sentence
+        sentence_token_counts = [count_tokens(sentence) for sentence in sentences]
+        
+        current_chunk_sentences = []
+        current_chunk_token_count = 0
+        
+        for i, (sentence, token_count) in enumerate(zip(sentences, sentence_token_counts)):
+            # If a single sentence exceeds chunk size, we need to split it further
+            if token_count > chunk_size:
+                # Just include it as its own chunk to avoid complexity
+                # This is a rare case that would require word-level chunking
+                document_chunks.append(sentence)
+                document_metadata.append({
+                    **doc['metadata'],
+                    'chunk_index': len(document_chunks) - 1,
+                    'is_large_sentence': True
+                })
+                continue
+            
+            # If adding this sentence would exceed the chunk size and we have content
+            if current_chunk_token_count + token_count > chunk_size and current_chunk_sentences:
+                # Save current chunk
+                chunk_text = ' '.join(current_chunk_sentences)
                 document_chunks.append(chunk_text)
-                document_metadata.append(doc['metadata'])
-
-                # Calculate how many sentences to keep for overlap
-                overlap_length = 0
+                document_metadata.append({
+                    **doc['metadata'],
+                    'chunk_index': len(document_chunks) - 1
+                })
+                
+                # Calculate overlap using tokens
                 overlap_sentences = []
-
-                for s in reversed(current_chunk):
-                    if overlap_length + len(s) <= overlap:
+                overlap_token_count = 0
+                
+                # Start from the end and work backwards for overlap
+                for s, s_token_count in reversed(list(zip(current_chunk_sentences,
+                                                         [count_tokens(s) for s in current_chunk_sentences]))):
+                    if overlap_token_count + s_token_count <= overlap:
                         overlap_sentences.insert(0, s)
-                        overlap_length += len(s)
+                        overlap_token_count += s_token_count
                     else:
                         break
-
+                
                 # Start new chunk with overlap sentences
-                current_chunk = overlap_sentences
-                current_length = overlap_length
-
-            # Add current sentence to chunk
-            current_chunk.append(sentence)
-            current_length += sentence_length
-
+                current_chunk_sentences = overlap_sentences
+                current_chunk_token_count = overlap_token_count
+            
+            # Add current sentence to the chunk
+            current_chunk_sentences.append(sentence)
+            current_chunk_token_count += token_count
+        
         # Don't forget the last chunk
-        if current_chunk:
-            chunk_text = ' '.join(current_chunk)
+        if current_chunk_sentences:
+            chunk_text = ' '.join(current_chunk_sentences)
             document_chunks.append(chunk_text)
-            document_metadata.append(doc['metadata'])
-
+            document_metadata.append({
+                **doc['metadata'],
+                'chunk_index': len(document_chunks) - 1
+            })
+    
     logger.info(f"Created {len(document_chunks)} chunks from {len(documents)} documents")
     return document_chunks, document_metadata
 
 def create_embeddings():
-    """Create embeddings for all document chunks"""
+    """Create embeddings for all document chunks with batching"""
     global chunk_embeddings
-
+    
     logger.info("Creating embeddings for document chunks...")
-    chunk_embeddings = model.encode(document_chunks)
+    
+    # Process in batches to avoid memory issues with large knowledge bases
+    batch_size = 32
+    all_embeddings = []
+    
+    for i in range(0, len(document_chunks), batch_size):
+        batch = document_chunks[i:i + batch_size]
+        try:
+            batch_embeddings = model.encode(batch, show_progress_bar=(len(batch) > 10))
+            all_embeddings.append(batch_embeddings)
+        except Exception as e:
+            logger.error(f"Error creating embeddings for batch {i//batch_size}: {str(e)}")
+            # Create zero embeddings as placeholders for failed batches
+            batch_embeddings = np.zeros((len(batch), model.get_sentence_embedding_dimension()))
+            all_embeddings.append(batch_embeddings)
+    
+    # Combine all batches
+    if all_embeddings:
+        chunk_embeddings = np.vstack(all_embeddings)
+    else:
+        chunk_embeddings = np.array([])
+    
     logger.info(f"Created {len(chunk_embeddings)} embeddings")
 
-def search_documents(query, top_k=3):
+def search_documents(query, top_k=TOP_K_RESULTS, min_score=0.25):
     """
-    Search for the most relevant document chunks.
-    Default top_k is set to 3; you can adjust dynamically if needed.
+    Search for the most relevant document chunks with a minimum similarity threshold.
     """
     # Encode the query
     query_embedding = model.encode([query])[0]
-
+    
     # Calculate similarity scores
     similarity_scores = cosine_similarity([query_embedding], chunk_embeddings)[0]
-
-    # Get top-k results
-    top_indices = np.argsort(similarity_scores)[-top_k:][::-1]
-
+    
+    # Get top-k results above the minimum score
+    indices_and_scores = [(idx, similarity_scores[idx]) for idx in range(len(similarity_scores))
+                           if similarity_scores[idx] >= min_score]
+    
+    # Sort by score (descending)
+    indices_and_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    # Take top_k
+    top_indices_and_scores = indices_and_scores[:top_k]
+    
     results = []
-    for idx in top_indices:
+    for idx, score in top_indices_and_scores:
         results.append({
             'chunk': document_chunks[idx],
             'metadata': document_metadata[idx],
-            'score': similarity_scores[idx]
+            'score': float(score)  # Convert numpy float to Python float for JSON serialization
         })
-
+    
     return results
 
-def extract_answer(query, relevant_chunks, max_length=40000):
+def extract_answer(query, relevant_chunks, max_tokens=1500):
     """
-    Extract a simple answer from relevant chunks.
-    Combines chunks and selects sentences most similar to the query.
+    Extract a coherent answer from relevant chunks using a more sophisticated approach:
+    1. Group chunks by document to maintain context
+    2. Use similarity to select the most relevant sections
+    3. Construct a more coherent narrative
     """
-    # Combine chunks, starting with the most relevant
-    combined_text = ' '.join([chunk['chunk'] for chunk in relevant_chunks])
-
-    # Split into sentences
-    sentences = sent_tokenize(combined_text)
-
-    # Get query embedding
+    if not relevant_chunks:
+        return "I couldn't find any relevant information to answer your question."
+    
+    # Group chunks by document
+    docs_chunks = {}
+    for chunk in relevant_chunks:
+        doc_id = chunk['metadata']['id']
+        if doc_id not in docs_chunks:
+            docs_chunks[doc_id] = []
+        docs_chunks[doc_id].append(chunk)
+    
+    # Sort chunks within each document by score
+    for doc_id in docs_chunks:
+        docs_chunks[doc_id].sort(key=lambda x: x['score'], reverse=True)
+    
+    # Get query embedding for sentence-level similarity
     query_embedding = model.encode([query])[0]
+    
+    # Create an answer that flows better by prioritizing document coherence
+    answer_parts = []
+    token_count = 0
+    
+    # First take the highest scoring chunk from each document
+    for doc_id, chunks in sorted(docs_chunks.items(), key=lambda x: x[1][0]['score'], reverse=True):
+        top_chunk = chunks[0]
+        
+        # Extract key sentences that are most relevant to the query
+        sentences = sent_tokenize(top_chunk['chunk'])
+        sentence_embeddings = model.encode(sentences)
+        sentence_scores = cosine_similarity([query_embedding], sentence_embeddings)[0]
+        
+        # Sort sentences by relevance
+        sorted_sent_indices = np.argsort(sentence_scores)[::-1]
+        
+        # Add document title as a subheading
+        doc_title = top_chunk['metadata']['title']
+        answer_part = f"From \"{doc_title}\":\n"
+        part_token_count = count_tokens(answer_part)
+        
+        # Add the most relevant sentences, respecting the token limit
+        added_sentences = set()  # Track sentences we've already added
+        for idx in sorted_sent_indices:
+            sentence = sentences[idx]
+            sentence_token_count = count_tokens(sentence)
+            
+            # Skip if we've seen this sentence or it would exceed our budget
+            if sentence in added_sentences or token_count + part_token_count + sentence_token_count > max_tokens:
+                continue
+                
+            answer_part += sentence + " "
+            part_token_count += sentence_token_count
+            added_sentences.add(sentence)
+        
+        # Only add this part if it has actual content beyond the heading
+        if part_token_count > count_tokens(f"From \"{doc_title}\":\n"):
+            answer_parts.append(answer_part)
+            token_count += part_token_count
+            
+            # Break if we've reached the token limit
+            if token_count >= max_tokens:
+                break
+    
+    # Combine all parts into a coherent answer
+    if answer_parts:
+        combined_answer = "\n\n".join(answer_parts)
+        return combined_answer
+    else:
+        return "I found some potentially relevant documents, but couldn't extract a specific answer to your question."
 
-    # Calculate sentence similarity to query
-    sentence_embeddings = model.encode(sentences)
-    similarities = cosine_similarity([query_embedding], sentence_embeddings)[0]
+def format_response(query, answer, relevant_chunks):
+    """Format the response for Slack with improved readability"""
+    # Format answer text
+    formatted_answer = answer.replace("\n\n", "\n").strip()
+    
+    # Prepare source citations using a set to avoid duplicates but maintain order
+    seen_sources = {}
+    for chunk in relevant_chunks:
+        url = chunk['metadata'].get('url')
+        title = chunk['metadata'].get('title')
+        space = chunk['metadata'].get('space')
+        last_updated = chunk['metadata'].get('last_updated', '')
+        
+        # Format the date if available
+        date_str = ""
+        if last_updated:
+            try:
+                # Parse ISO format date if possible
+                date_obj = datetime.fromisoformat(last_updated.replace('Z', '+00:00'))
+                date_str = f", last updated {date_obj.strftime('%b %d, %Y')}"
+            except:
+                # If parsing fails, use the raw string
+                date_str = f", last updated {last_updated}"
+        
+        if url and title and url not in seen_sources:
+            seen_sources[url] = f"*{title}* ({space}{date_str})\n{url}"
+    
+    # Build the related wikis section
+    related_wikis = "\n".join([f"{idx+1}. {info}" for idx, info in enumerate(seen_sources.values())])
+    
+    # Build the final response
+    formatted_response = f"*Your Query:* {query}\n\n"
+    formatted_response += "*Answer:*\n" + formatted_answer + "\n\n"
+    
+    if related_wikis:
+        formatted_response += "*Sources:*\n" + related_wikis
+    
+    return formatted_response
 
-    # Sort sentences by relevance
-    sorted_idx = np.argsort(similarities)[::-1]
+def initialize_knowledge_base(force=False):
+    """Initialize the knowledge base from Confluence or load from cache"""
+    global document_chunks, chunk_embeddings, document_metadata, last_refresh_time
+    
+    with knowledge_base_lock:
+        # If we have a valid cache and aren't forcing a refresh, use it
+        if not force and ConfluenceCache.is_cache_valid():
+            logger.info("Loading knowledge base from cache...")
+            document_chunks = ConfluenceCache.load_from_cache("chunks")
+            chunk_embeddings = ConfluenceCache.load_from_cache("embeddings")
+            document_metadata = ConfluenceCache.load_from_cache("metadata")
+            
+            if (document_chunks is not None and
+                isinstance(chunk_embeddings, np.ndarray) and len(chunk_embeddings) > 0 and
+                document_metadata is not None):
+                logger.info(f"Successfully loaded knowledge base from cache: {len(document_chunks)} chunks")
+                last_refresh_time = datetime.now()
+                return True
+            else:
+                logger.warning("Cache seems corrupt or incomplete, rebuilding knowledge base")
+                # Fall through to rebuild
+        
+        # If cache is invalid or we're forcing a refresh, build from scratch
+        logger.info("Building knowledge base from Confluence...")
+        try:
+            start_time = time.time()
+            documents = fetch_confluence_content()
+            chunk_documents(documents)
+            create_embeddings()
+            last_refresh_time = datetime.now()
+            
+            # Save to cache
+            ConfluenceCache.save_to_cache(document_chunks, "chunks")
+            ConfluenceCache.save_to_cache(chunk_embeddings, "embeddings")
+            ConfluenceCache.save_to_cache(document_metadata, "metadata")
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"Knowledge base initialized in {elapsed_time:.2f} seconds with {len(document_chunks)} chunks")
+            return True
+        except Exception as e:
+            logger.error(f"Error initializing knowledge base: {str(e)}")
+            return False
 
-    # Build answer using most relevant sentences until max_length
-    answer = ""
-    current_length = 0
+def auto_refresh_knowledge_base():
+    """Background thread to automatically refresh the knowledge base"""
+    global last_refresh_time
+    
+    logger.info("Starting automatic knowledge base refresh thread")
+    while not refresh_event.is_set():
+        # Sleep for a bit, checking periodically if we should exit
+        for _ in range(60):  # Check every minute if we should exit
+            if refresh_event.is_set():
+                break
+            time.sleep(60)
+        
+        # If it's time to refresh (or it's never been refreshed), do it
+        with knowledge_base_lock:
+            if (not last_refresh_time or
+                (datetime.now() - last_refresh_time > timedelta(hours=REFRESH_INTERVAL))):
+                logger.info("Auto-refreshing knowledge base...")
+                initialize_knowledge_base(force=True)
+    
+    logger.info("Automatic knowledge base refresh thread stopped")
 
-    for idx in sorted_idx:
-        sentence = sentences[idx]
-        if current_length + len(sentence) <= max_length:
-            answer += sentence + " "
-            current_length += len(sentence)
-        else:
-            break
-
-    return answer.strip()
-
-def initialize_knowledge_base():
-    """Initialize the knowledge base from Confluence"""
-    logger.info("Initializing knowledge base from Confluence...")
-    documents = fetch_confluence_content()
-    chunk_documents(documents)  # Uses default chunk_size=512 and overlap=128
-    create_embeddings()
-    logger.info("Knowledge base initialized successfully!")
+def ensure_knowledge_base(say=None):
+    """Ensure the knowledge base is initialized"""
+    global document_chunks, auto_refresh_thread
+    
+    # Start the auto-refresh thread if it's not running
+    if auto_refresh_thread is None or not auto_refresh_thread.is_alive():
+        refresh_event.clear()
+        auto_refresh_thread = threading.Thread(target=auto_refresh_knowledge_base, daemon=True)
+        auto_refresh_thread.start()
+    
+    # Initialize if needed
+    with knowledge_base_lock:
+        if len(document_chunks) == 0 or not isinstance(chunk_embeddings, np.ndarray) or len(chunk_embeddings) == 0:
+            if say:
+                say(text="Initializing knowledge base for the first time. This may take a few minutes...")
+            success = initialize_knowledge_base()
+            if success and say:
+                say(text="Knowledge base initialized! Now processing your question...")
+            return success
+        return True
 
 @app.event("app_mention")
-def handle_app_mentions(body, say):
-    """
-    Process messages where the bot is mentioned in channels.
-    (This listener is kept so that the bot can still be addressed in channels.)
-    """
+def handle_app_mentions(body, say, client):
+    """Process messages where the bot is mentioned in channels."""
     event = body["event"]
+    channel_id = event["channel"]
+    thread_ts = event.get("thread_ts", event.get("ts"))
+    user_id = event["user"]
     text = event["text"]
-
+    
     # Extract the question (remove the app mention)
     question = re.sub(r'<@[A-Z0-9]+>\s*', '', text).strip()
-
+    
     if not question:
         say(text="Please ask me a question about Confluence documents! 📚")
         return
-
+    
+    # Check for admin commands
     if question.lower() == "refresh":
-        say(text="Refreshing knowledge base from Confluence... This may take a few minutes.")
-        initialize_knowledge_base()
-        say(text="Knowledge base refreshed successfully! 🎉")
+        user_info = client.users_info(user=user_id)
+        user_is_admin = user_info.get("user", {}).get("is_admin", False)
+        
+        if user_is_admin:
+            say(text="Refreshing knowledge base from Confluence... This may take a few minutes.")
+            success = initialize_knowledge_base(force=True)
+            if success:
+                say(text="Knowledge base refreshed successfully! 🎉")
+            else:
+                say(text="There was an error refreshing the knowledge base. Please check the logs.")
+        else:
+            say(text="Sorry, only workspace admins can refresh the knowledge base.")
         return
-
-    try:
-        if len(document_chunks) == 0:
-            say(text="Initializing knowledge base for the first time. This may take a few minutes...")
-            initialize_knowledge_base()
-            say(text="Knowledge base initialized! Now processing your question...")
-
-        relevant_chunks = search_documents(question, top_k=3)
-        if not relevant_chunks:
-            say(text="I couldn't find any relevant information in the Confluence documents. Please try rephrasing your question.")
+    
+    # Check if a thread is already in progress for this channel
+    with active_threads_lock:
+        if channel_id in active_threads:
+            say(text="I'm already processing a request. Please wait until it's complete before asking another question.")
             return
-
+        active_threads[channel_id] = thread_ts
+    
+    try:
+        # Show typing indicator
+        try:
+            client.reactions_add(
+                channel=channel_id,
+                timestamp=thread_ts,
+                name="thinking_face"
+            )
+        except Exception as e:
+            # If we can't add reactions, just log it and continue
+            logger.warning(f"Could not add reaction: {str(e)}. This is non-critical.")
+            # Use typing indicator as alternative if reactions fail
+            try:
+                client.conversations_mark(channel=channel_id, ts=thread_ts)
+            except:
+                pass
+        
+        # Ensure knowledge base is initialized
+        if not ensure_knowledge_base(say):
+            say(text="I'm having trouble accessing the knowledge base. Please try again later.")
+            return
+        
+        # Log the query
+        logger.info(f"Processing question from <@{user_id}>: {question}")
+        
+        # Search for relevant documents
+        relevant_chunks = search_documents(question, top_k=TOP_K_RESULTS)
+        
+        if not relevant_chunks:
+            say(text="I couldn't find any relevant information in the Confluence documents. Please try rephrasing your question or check that the documents you're looking for are in the indexed spaces.")
+            return
+        
+        # Extract answer
         answer = extract_answer(question, relevant_chunks)
-        answer_sentences = sent_tokenize(answer)
-        bullet_answer = "\n".join([f"- {sentence}" for sentence in answer_sentences])
-
-        seen_sources = {}
-        for chunk in relevant_chunks:
-            url = chunk['metadata'].get('url')
-            title = chunk['metadata'].get('title')
-            if url and title and url not in seen_sources:
-                seen_sources[url] = title
-
-        related_wikis = ""
-        for idx, (url, title) in enumerate(seen_sources.items()):
-            related_wikis += f"{idx+1}. [{title}]({url})\n"
-
-        formatted_response = f"*Your Query:* {question}\n"
-        formatted_response += "*Answer:*\n" + bullet_answer + "\n\n"
-        formatted_response += "*Related Wikis:*\n" + related_wikis.strip()
-
-        send_long_message_generic(say, text=formatted_response)
-
+        
+        # Format response
+        formatted_response = format_response(question, answer, relevant_chunks)
+        
+        # Remove typing indicator
+        try:
+            client.reactions_remove(
+                channel=channel_id,
+                timestamp=thread_ts,
+                name="thinking_face"
+            )
+        except Exception as e:
+            # If we can't remove reactions, just log it and continue
+            logger.warning(f"Could not remove reaction: {str(e)}. This is non-critical.")
+        
+        # Send the response
+        send_long_message(say, formatted_response, thread_ts=thread_ts)
+    
     except Exception as e:
         logger.error(f"Error processing question: {str(e)}")
         say(text="Sorry, I encountered an error while processing your question. Please try again later.")
+    
+    finally:
+        # Remove channel from active threads
+        with active_threads_lock:
+            if channel_id in active_threads:
+                del active_threads[channel_id]
 
 @app.message("help")
 def help_message(message, say):
@@ -328,70 +752,248 @@ I'm your secure, local Confluence knowledge assistant. I can help you find infor
 *Commands:*
 • Send me a DM with your question about Confluence documents.
 • In channels, mention me with your question (e.g., `@ConfluenceBot What is our return policy?`).
-• Send `refresh` to update my knowledge base.
+• Admins can send `refresh` to update my knowledge base.
 • `help` - Show this help message.
+
+*Tips for Good Questions:*
+• Be specific in your questions
+• Include keywords that might appear in the documents
+• If you don't get a good answer, try rephrasing your question
+
+*My Knowledge:*
+• I only know what's in your Confluence workspace
+• My knowledge updates automatically every 24 hours
+• I can search across all spaces or specific ones (configured by your admin)
     """
     say(text=help_text)
 
 @app.event("message")
-def handle_dm_messages(body, say):
-    """
-    Process direct messages (DMs) sent to the bot.
-    This listener checks if the message is in a DM channel (channel_type "im") and handles it.
-    """
+def handle_dm_messages(body, say, client):
+    """Process direct messages (DMs) sent to the bot."""
     event = body.get("event", {})
+    
+    # Only process DMs
     if event.get("channel_type") != "im":
-        return  # Only process DMs here
-
+        return
+        
+    channel_id = event.get("channel")
+    user_id = event.get("user")
+    thread_ts = event.get("thread_ts", event.get("ts"))
     question = event.get("text", "").strip()
-
+    
+    # Ignore messages from bots (including ourselves)
+    if event.get("bot_id") or user_id == "USLACKBOT":
+        return
+    
     if not question:
         say(text="Please ask me a question about Confluence documents! 📚")
         return
-
+    
+    # Check for admin commands
     if question.lower() == "refresh":
-        say(text="Refreshing knowledge base from Confluence... This may take a few minutes.")
-        initialize_knowledge_base()
-        say(text="Knowledge base refreshed successfully! 🎉")
+        user_info = client.users_info(user=user_id)
+        user_is_admin = user_info.get("user", {}).get("is_admin", False)
+        
+        if user_is_admin:
+            say(text="Refreshing knowledge base from Confluence... This may take a few minutes.")
+            success = initialize_knowledge_base(force=True)
+            if success:
+                say(text="Knowledge base refreshed successfully! 🎉")
+            else:
+                say(text="There was an error refreshing the knowledge base. Please check the logs.")
+        else:
+            say(text="Sorry, only workspace admins can refresh the knowledge base.")
         return
-
-    try:
-        if len(document_chunks) == 0:
-            say(text="Initializing knowledge base for the first time. This may take a few minutes...")
-            initialize_knowledge_base()
-            say(text="Knowledge base initialized! Now processing your question...")
-
-        relevant_chunks = search_documents(question, top_k=3)
-        if not relevant_chunks:
-            say(text="I couldn't find any relevant information in the Confluence documents. Please try rephrasing your question.")
+    
+    if question.lower() == "help":
+        help_message(event, say)
+        return
+    
+    # Check if a thread is already in progress for this channel
+    with active_threads_lock:
+        if channel_id in active_threads:
+            say(text="I'm already processing a request. Please wait until it's complete before asking another question.")
             return
-
+        active_threads[channel_id] = thread_ts
+    
+    try:
+        # Show typing indicator
+        try:
+            client.reactions_add(
+                channel=channel_id,
+                timestamp=thread_ts,
+                name="thinking_face"
+            )
+        except Exception as e:
+            # If we can't add reactions, just log it and continue
+            logger.warning(f"Could not add reaction: {str(e)}. This is non-critical.")
+        
+        # Ensure knowledge base is initialized
+        if not ensure_knowledge_base(say):
+            say(text="I'm having trouble accessing the knowledge base. Please try again later.")
+            return
+        
+        # Log the query
+        logger.info(f"Processing DM question from <@{user_id}>: {question}")
+        
+        # Search for relevant documents
+        relevant_chunks = search_documents(question, top_k=TOP_K_RESULTS)
+        
+        if not relevant_chunks:
+            say(text="I couldn't find any relevant information in the Confluence documents. Please try rephrasing your question or check that the documents you're looking for are in the indexed spaces.")
+            return
+        
+        # Extract answer
         answer = extract_answer(question, relevant_chunks)
-        answer_sentences = sent_tokenize(answer)
-        bullet_answer = "\n".join([f"- {sentence}" for sentence in answer_sentences])
-
-        seen_sources = {}
-        for chunk in relevant_chunks:
-            url = chunk['metadata'].get('url')
-            title = chunk['metadata'].get('title')
-            if url and title and url not in seen_sources:
-                seen_sources[url] = title
-
-        related_wikis = ""
-        for idx, (url, title) in enumerate(seen_sources.items()):
-            related_wikis += f"{idx+1}. [{title}]({url})\n"
-
-        formatted_response = f"*Your Query:* {question}\n"
-        formatted_response += "*Answer:*\n" + bullet_answer + "\n\n"
-        formatted_response += "*Related Wikis:*\n" + related_wikis.strip()
-
-        send_long_message_generic(say, text=formatted_response)
-
+        
+        # Format response
+        formatted_response = format_response(question, answer, relevant_chunks)
+        
+        # Remove typing indicator
+        try:
+            client.reactions_remove(
+                channel=channel_id,
+                timestamp=thread_ts,
+                name="thinking_face"
+            )
+        except Exception as e:
+            # If we can't remove reactions, just log it and continue
+            logger.warning(f"Could not remove reaction: {str(e)}. This is non-critical.")
+        
+        # Send the response
+        send_long_message(say, formatted_response, thread_ts=thread_ts)
+    
     except Exception as e:
         logger.error(f"Error processing DM question: {str(e)}")
         say(text="Sorry, I encountered an error while processing your question. Please try again later.")
+    
+    finally:
+        # Remove channel from active threads
+        with active_threads_lock:
+            if channel_id in active_threads:
+                del active_threads[channel_id]
+
+@app.event("app_home_opened")
+def update_home_tab(client, event, logger):
+    """Update the app home tab when a user opens it"""
+    user_id = event["user"]
+    
+    try:
+        # Publish view to Home tab
+        client.views_publish(
+            user_id=user_id,
+            view={
+                "type": "home",
+                "blocks": [
+                    {
+                        "type": "header",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Confluence Knowledge Bot",
+                            "emoji": True
+                        }
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "Welcome to the Confluence Knowledge Bot! I can help you find information from your Confluence workspace."
+                        }
+                    },
+                    {
+                        "type": "divider"
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "*How to use me:*"
+                        }
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "• Send me a direct message with your question\n• Mention me in a channel with your question\n• Try to be specific in your questions"
+                        }
+                    },
+                    {
+                        "type": "divider"
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": f"Last knowledge base refresh: {last_refresh_time.strftime('%Y-%m-%d %H:%M:%S') if last_refresh_time else 'Never'}"
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error publishing home tab: {str(e)}")
+
+# Function to save and restore state (for graceful shutdowns)
+def save_state():
+    """Save the current state to disk for recovery"""
+    with knowledge_base_lock:
+        if document_chunks and isinstance(chunk_embeddings, np.ndarray) and len(chunk_embeddings) > 0 and document_metadata:
+            try:
+                state = {
+                    "last_refresh_time": last_refresh_time.isoformat() if last_refresh_time else None,
+                }
+                with open(os.path.join(CACHE_DIR, "state.json"), 'w') as f:
+                    json.dump(state, f)
+                logger.info("Saved state to disk")
+            except Exception as e:
+                logger.error(f"Error saving state: {str(e)}")
+
+def load_state():
+    """Load saved state from disk"""
+    global last_refresh_time
+    
+    try:
+        state_path = os.path.join(CACHE_DIR, "state.json")
+        if os.path.exists(state_path):
+            with open(state_path, 'r') as f:
+                state = json.load(f)
+                
+            if state.get("last_refresh_time"):
+                last_refresh_time = datetime.fromisoformat(state["last_refresh_time"])
+                logger.info(f"Loaded state: last refresh {last_refresh_time}")
+    except Exception as e:
+        logger.error(f"Error loading state: {str(e)}")
+
+# Add a signal handler for graceful shutdown
+def signal_handler(sig, frame):
+    """Handle termination signals"""
+    logger.info("Received shutdown signal, cleaning up...")
+    refresh_event.set()  # Signal the background thread to exit
+    save_state()
+    logger.info("Cleanup complete, exiting")
+    sys.exit(0)
 
 # Initialize the app and start it using Socket Mode
 if __name__ == "__main__":
+    import signal
+    import sys
+    
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Load previous state
+    load_state()
+    
+    # Ensure the knowledge base is initialized
     initialize_knowledge_base()
+    
+    # Start the automatic refresh thread
+    refresh_event.clear()
+    auto_refresh_thread = threading.Thread(target=auto_refresh_knowledge_base, daemon=True)
+    auto_refresh_thread.start()
+    
+    logger.info("Starting Confluence Knowledge Bot...")
     SocketModeHandler(app, SLACK_APP_TOKEN).start()
