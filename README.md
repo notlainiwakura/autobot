@@ -1,6 +1,6 @@
-# Improved Confluence Knowledge Bot
+# AutoBot
 
-A Slack bot that connects to your Confluence workspace and uses advanced retrieval techniques to answer questions about your documentation. The bot runs entirely within your infrastructure, keeping your data secure and private.
+A Slack bot that connects to our Confluence workspace and uses advanced retrieval techniques to answer questions about our documentation. The bot runs entirely within our infrastructure, keeping our data secure and private.
 
 ## Features
 
@@ -75,7 +75,7 @@ LANGCHAIN_CACHE_DIR=langchain_cache  # Directory for LangChain cache
    - macOS/Linux: `source venv/bin/activate`
 4. Install dependencies: `pip install -r requirements.txt`
 5. Create your `.env` file with the required credentials
-6. Run the bot: `python bot.py`
+6. Run the bot: `python main.py`
 
 ### Slack App Permissions
 
@@ -120,23 +120,6 @@ faiss-cpu
 - Include keywords that might appear in the documents
 - If you don't get a good answer, try rephrasing your question
 
-## Key Improvements Over Original Version
-
-1. **Token-Based Chunking**: Now uses accurate token counting for better context management
-2. **Enhanced Answer Generation**: Groups content by document for more coherent answers
-3. **Smarter Message Handling**: Better splitting of long messages to maintain readability
-4. **Caching System**: Persistent storage of processed documents and embeddings
-5. **Background Refreshes**: Automatically updates the knowledge base at configurable intervals
-6. **Parallel Processing**: Faster document processing with multithreading
-7. **More Detailed Metadata**: Captures and displays richer information about sources
-8. **Thread Safety**: Properly handles concurrent requests
-9. **Graceful Recovery**: Better handling of shutdowns and restarts
-10. **Home Tab Interface**: Added Slack home tab for improved user experience
-11. **Enhanced Error Handling**: More robust error management throughout
-12. **Typing Indicators**: Visual feedback when processing requests
-13. **User Permission Controls**: Admin-only refresh feature
-14. **Configurable Parameters**: More options to tune performance
-
 ## Architecture
 
 The bot follows a Retrieval-Augmented Generation (RAG) approach:
@@ -153,5 +136,3 @@ The bot follows a Retrieval-Augmented Generation (RAG) approach:
    - Extracts relevant sentences from these chunks
    - Organizes information by source document
    - Formats a coherent response with citations
-
-This approach ensures that answers are directly grounded in your Confluence content, avoiding hallucination and providing transparent source citations.
