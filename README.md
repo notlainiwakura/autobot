@@ -1,4 +1,4 @@
-# Improved Confluence Knowledge Bot
+# AutoBot
 
 A Slack bot that connects to your Confluence workspace and uses advanced retrieval techniques to answer questions about your documentation. The bot runs entirely within your infrastructure, keeping your data secure and private.
 
