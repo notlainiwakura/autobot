@@ -21,10 +21,87 @@ import json
 import tiktoken
 from typing import List, Dict, Any, Tuple, Optional
 
+# At the top of your script after imports
+print("Checking Vertex AI dependencies...")
+try:
+    from langchain_google_vertexai import ChatVertexAI
+    from langchain.schema import Document
+    from langchain.vectorstores import FAISS
+    from langchain.embeddings import SentenceTransformerEmbeddings
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain.prompts import PromptTemplate
+    print("Successfully imported Vertex AI libraries")
+except ImportError as e:
+    print(f"Failed to import Vertex AI dependencies: {e}")
+
 # Check for Vertex AI integration
 vertex_ai_available = False
 vertex_connector = None
 langchain_vector_store = None
+
+# Load variables from .env file
+load_dotenv()
+
+# Environment variables
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
+CONFLUENCE_URL = os.environ["CONFLUENCE_URL"]
+CONFLUENCE_USERNAME = os.environ["CONFLUENCE_USERNAME"]
+CONFLUENCE_API_TOKEN = os.environ["CONFLUENCE_API_TOKEN"]
+SPACE_KEY = os.environ.get("CONFLUENCE_SPACE_KEY", None)  # Optional, can specify multiple spaces
+CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
+REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL_HOURS", 24))  # Default refresh every 24 hours
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))  # Thread pool size for parallel processing
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 512))   # Default chunk size
+CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 128))  # Default chunk overlap
+TOP_K_RESULTS = int(os.environ.get("TOP_K_RESULTS", 5))  # Default number of results to return
+
+# Google Cloud & Vertex AI settings
+USE_VERTEX_AI = os.environ.get("USE_VERTEX_AI", "false").lower() == "true"
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
+VERTEX_MODEL = os.environ.get("VERTEX_MODEL", "gemini-1.5-pro")
+LANGCHAIN_CACHE_DIR = os.environ.get("LANGCHAIN_CACHE_DIR", "langchain_cache")
+
+
+
+def create_qa_chain_with_vertex(project_id, documents, cache_dir=LANGCHAIN_CACHE_DIR,
+                              location=GCP_LOCATION, model_name=VERTEX_MODEL):
+    """Create a question-answering chain using Vertex AI and LangChain."""
+    try:
+        # Initialize embedding function
+        embeddings = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL)
+        
+        # Create vector store
+        Path(cache_dir).mkdir(exist_ok=True)
+        
+        # Convert documents to LangChain format
+        langchain_docs = []
+        for doc in documents:
+            langchain_docs.append(
+                Document(
+                    page_content=doc['content'],
+                    metadata=doc['metadata']
+                )
+            )
+        
+        # Create or load vector store
+        vector_store = FAISS.from_documents(
+            documents=langchain_docs,
+            embedding=embeddings
+        )
+        
+        # Initialize Vertex AI connector
+        connector = VertexAIConnector(
+            project_id=project_id,
+            location=location,
+            model_name=model_name
+        )
+        
+        return vector_store, connector
+    except Exception as e:
+        logger.error(f"Error creating QA chain with Vertex AI: {str(e)}")
+        return None, None
 
 if os.environ.get("USE_VERTEX_AI", "false").lower() == "true":
     try:
@@ -33,7 +110,7 @@ if os.environ.get("USE_VERTEX_AI", "false").lower() == "true":
         from langchain_google_vertexai import ChatVertexAI
         from langchain.schema import Document
         from langchain.vectorstores import FAISS
-        from langchain.embeddings import SentenceTransformerEmbeddings
+        from langchain_community.embeddings import SentenceTransformerEmbeddings
         from langchain.text_splitter import RecursiveCharacterTextSplitter
         from langchain.prompts import PromptTemplate
         
@@ -92,6 +169,13 @@ Include key facts and details from the context, but keep the overall answer conc
                     
                     # Generate response
                     response = self.llm.invoke(self.prompt_template.format(**prompt_input))
+                    if hasattr(response, 'content'):
+                        return response.content.strip()
+                    elif isinstance(response, str):
+                        return response.strip()
+                    else:
+                        logger.warning(f"Unexpected response type: {type(response)}")
+                        return str(response)
                     return response.strip()
                 except Exception as e:
                     logger.error(f"Error generating Vertex AI response: {str(e)}")
@@ -150,8 +234,7 @@ Include key facts and details from the context, but keep the overall answer conc
 # Download NLTK data for tokenization
 nltk.download('punkt', quiet=True)
 
-# Load variables from .env file
-load_dotenv()
+
 
 # Set up logging with more detailed format
 logging.basicConfig(
@@ -164,26 +247,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Environment variables
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
-CONFLUENCE_URL = os.environ["CONFLUENCE_URL"]
-CONFLUENCE_USERNAME = os.environ["CONFLUENCE_USERNAME"]
-CONFLUENCE_API_TOKEN = os.environ["CONFLUENCE_API_TOKEN"]
-SPACE_KEY = os.environ.get("CONFLUENCE_SPACE_KEY", None)  # Optional, can specify multiple spaces
-CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
-REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL_HOURS", 24))  # Default refresh every 24 hours
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))  # Thread pool size for parallel processing
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 512))   # Default chunk size
-CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 128))  # Default chunk overlap
-TOP_K_RESULTS = int(os.environ.get("TOP_K_RESULTS", 5))  # Default number of results to return
-
-# Google Cloud & Vertex AI settings
-USE_VERTEX_AI = os.environ.get("USE_VERTEX_AI", "false").lower() == "true"
-GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
-GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
-VERTEX_MODEL = os.environ.get("VERTEX_MODEL", "gemini-1.5-pro")
-LANGCHAIN_CACHE_DIR = os.environ.get("LANGCHAIN_CACHE_DIR", "langchain_cache")
 
 # Create cache directory if it doesn't exist
 Path(CACHE_DIR).mkdir(exist_ok=True)
