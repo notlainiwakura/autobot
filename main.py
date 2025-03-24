@@ -1,8 +1,10 @@
+
 import re
 import logging
 import numpy as np
 import pickle
 import time
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from slack_bolt import App
@@ -39,70 +41,6 @@ vertex_ai_available = False
 vertex_connector = None
 langchain_vector_store = None
 
-# Load variables from .env file
-load_dotenv()
-
-# Environment variables
-SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
-SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
-CONFLUENCE_URL = os.environ["CONFLUENCE_URL"]
-CONFLUENCE_USERNAME = os.environ["CONFLUENCE_USERNAME"]
-CONFLUENCE_API_TOKEN = os.environ["CONFLUENCE_API_TOKEN"]
-SPACE_KEY = os.environ.get("CONFLUENCE_SPACE_KEY", None)  # Optional, can specify multiple spaces
-CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
-REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL_HOURS", 24))  # Default refresh every 24 hours
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))  # Thread pool size for parallel processing
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 512))   # Default chunk size
-CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 128))  # Default chunk overlap
-TOP_K_RESULTS = int(os.environ.get("TOP_K_RESULTS", 5))  # Default number of results to return
-
-# Google Cloud & Vertex AI settings
-USE_VERTEX_AI = os.environ.get("USE_VERTEX_AI", "false").lower() == "true"
-GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
-GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
-VERTEX_MODEL = os.environ.get("VERTEX_MODEL", "gemini-1.5-pro")
-LANGCHAIN_CACHE_DIR = os.environ.get("LANGCHAIN_CACHE_DIR", "langchain_cache")
-
-
-
-def create_qa_chain_with_vertex(project_id, documents, cache_dir=LANGCHAIN_CACHE_DIR,
-                              location=GCP_LOCATION, model_name=VERTEX_MODEL):
-    """Create a question-answering chain using Vertex AI and LangChain."""
-    try:
-        # Initialize embedding function
-        embeddings = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL)
-        
-        # Create vector store
-        Path(cache_dir).mkdir(exist_ok=True)
-        
-        # Convert documents to LangChain format
-        langchain_docs = []
-        for doc in documents:
-            langchain_docs.append(
-                Document(
-                    page_content=doc['content'],
-                    metadata=doc['metadata']
-                )
-            )
-        
-        # Create or load vector store
-        vector_store = FAISS.from_documents(
-            documents=langchain_docs,
-            embedding=embeddings
-        )
-        
-        # Initialize Vertex AI connector
-        connector = VertexAIConnector(
-            project_id=project_id,
-            location=location,
-            model_name=model_name
-        )
-        
-        return vector_store, connector
-    except Exception as e:
-        logger.error(f"Error creating QA chain with Vertex AI: {str(e)}")
-        return None, None
-
 if os.environ.get("USE_VERTEX_AI", "false").lower() == "true":
     try:
         print("Attempting to import Vertex AI dependencies...")
@@ -110,7 +48,7 @@ if os.environ.get("USE_VERTEX_AI", "false").lower() == "true":
         from langchain_google_vertexai import ChatVertexAI
         from langchain.schema import Document
         from langchain.vectorstores import FAISS
-        from langchain_community.embeddings import SentenceTransformerEmbeddings
+        from langchain.embeddings import SentenceTransformerEmbeddings
         from langchain.text_splitter import RecursiveCharacterTextSplitter
         from langchain.prompts import PromptTemplate
         
@@ -169,6 +107,8 @@ Include key facts and details from the context, but keep the overall answer conc
                     
                     # Generate response
                     response = self.llm.invoke(self.prompt_template.format(**prompt_input))
+                    
+                    # Extract content from the AIMessage object
                     if hasattr(response, 'content'):
                         return response.content.strip()
                     elif isinstance(response, str):
@@ -176,7 +116,6 @@ Include key facts and details from the context, but keep the overall answer conc
                     else:
                         logger.warning(f"Unexpected response type: {type(response)}")
                         return str(response)
-                    return response.strip()
                 except Exception as e:
                     logger.error(f"Error generating Vertex AI response: {str(e)}")
                     return self._generate_fallback_response(query, relevant_chunks)
@@ -210,15 +149,45 @@ Include key facts and details from the context, but keep the overall answer conc
                 
                 return f"Based on the available information:\n\n{content}\n\n(Note: This is a fallback response due to an issue with the AI processing.)"
         
-        # Define function to create Vertex AI components
-        def create_vertex_ai_components(project_id, documents):
-            # Create Vertex AI connector
-            connector = VertexAIConnector(
-                project_id=project_id,
-                location=GCP_LOCATION,
-                model_name=VERTEX_MODEL
-            )
-            return connector
+        # Define function to create QA chain with Vertex AI
+        def create_qa_chain_with_vertex(project_id, documents, cache_dir=None,
+                                      location="us-central1", model_name="gemini-1.5-pro"):
+            """Create a question-answering chain using Vertex AI and LangChain."""
+            try:
+                # Initialize embedding function
+                embeddings = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL)
+                
+                # Create directory if provided
+                if cache_dir:
+                    Path(cache_dir).mkdir(exist_ok=True)
+                
+                # Convert documents to LangChain format
+                langchain_docs = []
+                for doc in documents:
+                    langchain_docs.append(
+                        Document(
+                            page_content=doc['content'],
+                            metadata=doc['metadata']
+                        )
+                    )
+                
+                # Create vector store
+                vector_store = FAISS.from_documents(
+                    documents=langchain_docs,
+                    embedding=embeddings
+                )
+                
+                # Initialize Vertex AI connector
+                connector = VertexAIConnector(
+                    project_id=project_id,
+                    location=location,
+                    model_name=model_name
+                )
+                
+                return vector_store, connector
+            except Exception as e:
+                logger.error(f"Error creating QA chain with Vertex AI: {str(e)}")
+                return None, None
         
         # Mark as available
         vertex_ai_available = True
@@ -234,7 +203,8 @@ Include key facts and details from the context, but keep the overall answer conc
 # Download NLTK data for tokenization
 nltk.download('punkt', quiet=True)
 
-
+# Load variables from .env file
+load_dotenv()
 
 # Set up logging with more detailed format
 logging.basicConfig(
@@ -247,6 +217,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Environment variables
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+SLACK_APP_TOKEN = os.environ["SLACK_APP_TOKEN"]
+CONFLUENCE_URL = os.environ["CONFLUENCE_URL"]
+CONFLUENCE_USERNAME = os.environ["CONFLUENCE_USERNAME"]
+CONFLUENCE_API_TOKEN = os.environ["CONFLUENCE_API_TOKEN"]
+SPACE_KEY = os.environ.get("CONFLUENCE_SPACE_KEY", None)  # Optional, can specify multiple spaces
+CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
+REFRESH_INTERVAL = int(os.environ.get("REFRESH_INTERVAL_HOURS", 24))  # Default refresh every 24 hours
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))  # Thread pool size for parallel processing
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 512))   # Default chunk size
+CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 128))  # Default chunk overlap
+TOP_K_RESULTS = int(os.environ.get("TOP_K_RESULTS", 5))  # Default number of results to return
+
+# Google Cloud & Vertex AI settings
+USE_VERTEX_AI = os.environ.get("USE_VERTEX_AI", "false").lower() == "true"
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
+VERTEX_MODEL = os.environ.get("VERTEX_MODEL", "gemini-1.5-pro")
+LANGCHAIN_CACHE_DIR = os.environ.get("LANGCHAIN_CACHE_DIR", "langchain_cache")
+
+# Message deduplication settings
+MESSAGE_CACHE_TTL = int(os.environ.get("MESSAGE_CACHE_TTL", 60))  # Time in seconds to keep messages in deduplication cache
+THREAD_TIMEOUT = int(os.environ.get("THREAD_TIMEOUT", 300))  # 5 minutes in seconds
 
 # Create cache directory if it doesn't exist
 Path(CACHE_DIR).mkdir(exist_ok=True)
@@ -284,12 +278,15 @@ last_refresh_time = None
 auto_refresh_thread = None
 refresh_event = threading.Event()
 
+# Message deduplication cache
+processed_messages = {}
+
 # Vertex AI and Langchain components
 vertex_connector = None
 langchain_vector_store = None
 
 # Mapping of Slack channel IDs to in-progress threads
-active_threads = {}
+active_threads = {}  # Format: {"channel_id:ts": (start_time, user_id)}
 active_threads_lock = threading.Lock()
 
 class ConfluenceCache:
@@ -347,6 +344,75 @@ class ConfluenceCache:
         except Exception as e:
             logger.error(f"Error checking cache validity: {str(e)}")
             return False
+
+def should_process_message(event):
+    """
+    Check if a message should be processed by creating a unique hash and
+    checking if we've seen it recently.
+    """
+    # Create a unique message signature
+    message_text = event.get("text", "")
+    channel = event.get("channel", "")
+    ts = event.get("ts", "")
+    
+    # Create a unique hash for this message
+    message_hash = hashlib.md5(f"{channel}:{ts}:{message_text}".encode()).hexdigest()
+    
+    current_time = datetime.now()
+    
+    # Clean up old entries from cache
+    expired_keys = []
+    for key, (timestamp, _) in processed_messages.items():
+        if current_time - timestamp > timedelta(seconds=MESSAGE_CACHE_TTL):
+            expired_keys.append(key)
+    
+    for key in expired_keys:
+        del processed_messages[key]
+    
+    # Check if we've processed this message recently
+    if message_hash in processed_messages:
+        logger.info(f"Skipping duplicate message: {message_text[:30]}...")
+        return False
+    
+    # Add to cache
+    processed_messages[message_hash] = (current_time, message_text)
+    return True
+
+def manage_active_thread(channel_id, thread_ts, user_id, action="add"):
+    """
+    Add, check, or remove a thread from the active threads tracking.
+    Returns True if the thread can be processed, False if it's already being processed.
+    """
+    thread_key = f"{channel_id}:{thread_ts}"
+    
+    with active_threads_lock:
+        current_time = time.time()
+        
+        # Clean up any expired threads
+        expired_keys = []
+        for key, (start_time, _) in active_threads.items():
+            if current_time - start_time > THREAD_TIMEOUT:
+                expired_keys.append(key)
+                
+        for key in expired_keys:
+            logger.info(f"Removing expired thread: {key}")
+            del active_threads[key]
+        
+        if action == "check":
+            return thread_key in active_threads
+            
+        elif action == "add":
+            if thread_key in active_threads:
+                return False
+            active_threads[thread_key] = (current_time, user_id)
+            return True
+            
+        elif action == "remove":
+            if thread_key in active_threads:
+                del active_threads[thread_key]
+            return True
+    
+    return False
 
 def count_tokens(text):
     """Count the number of tokens in a text using tiktoken"""
@@ -709,7 +775,7 @@ def extract_answer(query, relevant_chunks, max_tokens=1500):
             part_token_count += sentence_token_count
             added_sentences.add(sentence)
         
-        # Only add this part if it has actual content beyond the heading
+            # Only add this part if it has actual content beyond the heading
         if part_token_count > count_tokens(f"From \"{doc_title}\":\n"):
             answer_parts.append(answer_part)
             token_count += part_token_count
@@ -905,6 +971,11 @@ def ensure_knowledge_base(say=None):
 def handle_app_mentions(body, say, client):
     """Process messages where the bot is mentioned in channels."""
     event = body["event"]
+    
+    # Skip if we've processed this message recently
+    if not should_process_message(event):
+        return
+        
     channel_id = event["channel"]
     thread_ts = event.get("thread_ts", event.get("ts"))
     user_id = event["user"]
@@ -933,12 +1004,10 @@ def handle_app_mentions(body, say, client):
             say(text="Sorry, only workspace admins can refresh the knowledge base.")
         return
     
-    # Check if a thread is already in progress for this channel
-    with active_threads_lock:
-        if channel_id in active_threads:
-            say(text="I'm already processing a request. Please wait until it's complete before asking another question.")
-            return
-        active_threads[channel_id] = thread_ts
+    # Check if this thread is already being processed
+    if not manage_active_thread(channel_id, thread_ts, user_id, "add"):
+        say(text="I'm already processing a request in this thread. Please wait until it's complete before asking another question.")
+        return
     
     try:
         # Show typing indicator
@@ -997,10 +1066,8 @@ def handle_app_mentions(body, say, client):
         say(text="Sorry, I encountered an error while processing your question. Please try again later.")
     
     finally:
-        # Remove channel from active threads
-        with active_threads_lock:
-            if channel_id in active_threads:
-                del active_threads[channel_id]
+        # Remove the thread from active tracking
+        manage_active_thread(channel_id, thread_ts, user_id, "remove")
 
 @app.message("help")
 def help_message(message, say):
@@ -1036,6 +1103,10 @@ def handle_dm_messages(body, say, client):
     # Only process DMs
     if event.get("channel_type") != "im":
         return
+    
+    # Skip if we've processed this message recently
+    if not should_process_message(event):
+        return
         
     channel_id = event.get("channel")
     user_id = event.get("user")
@@ -1070,12 +1141,10 @@ def handle_dm_messages(body, say, client):
         help_message(event, say)
         return
     
-    # Check if a thread is already in progress for this channel
-    with active_threads_lock:
-        if channel_id in active_threads:
-            say(text="I'm already processing a request. Please wait until it's complete before asking another question.")
-            return
-        active_threads[channel_id] = thread_ts
+    # Check if this thread is already being processed
+    if not manage_active_thread(channel_id, thread_ts, user_id, "add"):
+        say(text="I'm already processing a request in this thread. Please wait until it's complete before asking another question.")
+        return
     
     try:
         # Show typing indicator
@@ -1129,10 +1198,8 @@ def handle_dm_messages(body, say, client):
         say(text="Sorry, I encountered an error while processing your question. Please try again later.")
     
     finally:
-        # Remove channel from active threads
-        with active_threads_lock:
-            if channel_id in active_threads:
-                del active_threads[channel_id]
+        # Remove the thread from active tracking
+        manage_active_thread(channel_id, thread_ts, user_id, "remove")
 
 @app.event("app_home_opened")
 def update_home_tab(client, event, logger):
