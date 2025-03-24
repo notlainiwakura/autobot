@@ -21,6 +21,132 @@ import json
 import tiktoken
 from typing import List, Dict, Any, Tuple, Optional
 
+# Check for Vertex AI integration
+vertex_ai_available = False
+vertex_connector = None
+langchain_vector_store = None
+
+if os.environ.get("USE_VERTEX_AI", "false").lower() == "true":
+    try:
+        print("Attempting to import Vertex AI dependencies...")
+        # Import required packages
+        from langchain_google_vertexai import ChatVertexAI
+        from langchain.schema import Document
+        from langchain.vectorstores import FAISS
+        from langchain.embeddings import SentenceTransformerEmbeddings
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+        from langchain.prompts import PromptTemplate
+        
+        # Define the VertexAI connector class inline
+        class VertexAIConnector:
+            def __init__(self, project_id, location="us-central1", model_name="gemini-1.5-pro",
+                         temperature=0.1, max_output_tokens=8000):
+                self.project_id = project_id
+                self.location = location
+                self.model_name = model_name
+                self.temperature = temperature
+                self.max_output_tokens = max_output_tokens
+                
+                # Initialize the LLM
+                self.llm = ChatVertexAI(
+                    project=project_id,
+                    location=location,
+                    model_name=model_name,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                    convert_system_message_to_human=True
+                )
+                
+                # Default prompt template for QA
+                self.prompt_template = PromptTemplate(
+                    template="""You are a helpful assistant that answers questions based on Confluence documentation.
+                    
+Context information is below:
+--------------------------
+{context}
+--------------------------
+
+Given the context information and not prior knowledge, answer the following question:
+{question}
+
+If the answer is not explicitly contained in the provided context, say "I don't have enough information to answer this question confidently."
+Answer in a professional, clear, and concise manner. Format the response with markdown when appropriate.
+Include key facts and details from the context, but keep the overall answer concise.
+""",
+                    input_variables=["context", "question"]
+                )
+            
+            def generate_response(self, query, relevant_chunks):
+                # Format the context
+                context = self._format_context(relevant_chunks)
+                
+                if not context:
+                    return "I couldn't find relevant information to answer your question."
+                
+                try:
+                    # Create input
+                    prompt_input = {
+                        "context": context,
+                        "question": query
+                    }
+                    
+                    # Generate response
+                    response = self.llm.invoke(self.prompt_template.format(**prompt_input))
+                    return response.strip()
+                except Exception as e:
+                    logger.error(f"Error generating Vertex AI response: {str(e)}")
+                    return self._generate_fallback_response(query, relevant_chunks)
+            
+            def _format_context(self, relevant_chunks):
+                if not relevant_chunks:
+                    return ""
+                
+                # Sort chunks by score
+                sorted_chunks = sorted(relevant_chunks, key=lambda x: x.get('score', 0), reverse=True)
+                
+                # Format chunks
+                formatted_chunks = []
+                for i, chunk in enumerate(sorted_chunks):
+                    metadata = chunk.get('metadata', {})
+                    title = metadata.get('title', 'Unknown document')
+                    content = chunk.get('chunk', '').strip()
+                    
+                    formatted_chunk = f"Document {i+1}: {title}\n{content}\n"
+                    formatted_chunks.append(formatted_chunk)
+                
+                return "\n\n".join(formatted_chunks)
+            
+            def _generate_fallback_response(self, query, relevant_chunks):
+                if not relevant_chunks:
+                    return "I couldn't find relevant information to answer your question."
+                
+                # Use highest scoring chunk
+                top_chunk = max(relevant_chunks, key=lambda x: x.get('score', 0))
+                content = top_chunk.get('chunk', '')
+                
+                return f"Based on the available information:\n\n{content}\n\n(Note: This is a fallback response due to an issue with the AI processing.)"
+        
+        # Define function to create Vertex AI components
+        def create_vertex_ai_components(project_id, documents):
+            # Create Vertex AI connector
+            connector = VertexAIConnector(
+                project_id=project_id,
+                location=GCP_LOCATION,
+                model_name=VERTEX_MODEL
+            )
+            return connector
+        
+        # Mark as available
+        vertex_ai_available = True
+        print("Successfully imported Vertex AI dependencies!")
+        
+    except ImportError as e:
+        print(f"Failed to import Vertex AI dependencies: {e}")
+        logging.warning(f"Vertex AI integration not available: {str(e)}. Install required packages.")
+    except Exception as e:
+        print(f"Unexpected error setting up Vertex AI: {e}")
+        logging.error(f"Unexpected error setting up Vertex AI: {str(e)}")
+
 # Download NLTK data for tokenization
 nltk.download('punkt', quiet=True)
 
@@ -51,6 +177,13 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))  # Thread pool size for para
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 512))   # Default chunk size
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 128))  # Default chunk overlap
 TOP_K_RESULTS = int(os.environ.get("TOP_K_RESULTS", 5))  # Default number of results to return
+
+# Google Cloud & Vertex AI settings
+USE_VERTEX_AI = os.environ.get("USE_VERTEX_AI", "false").lower() == "true"
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
+VERTEX_MODEL = os.environ.get("VERTEX_MODEL", "gemini-1.5-pro")
+LANGCHAIN_CACHE_DIR = os.environ.get("LANGCHAIN_CACHE_DIR", "langchain_cache")
 
 # Create cache directory if it doesn't exist
 Path(CACHE_DIR).mkdir(exist_ok=True)
@@ -87,6 +220,10 @@ knowledge_base_lock = threading.Lock()  # Thread safety for knowledge base acces
 last_refresh_time = None
 auto_refresh_thread = None
 refresh_event = threading.Event()
+
+# Vertex AI and Langchain components
+vertex_connector = None
+langchain_vector_store = None
 
 # Mapping of Slack channel IDs to in-progress threads
 active_threads = {}
@@ -442,14 +579,23 @@ def search_documents(query, top_k=TOP_K_RESULTS, min_score=0.25):
 
 def extract_answer(query, relevant_chunks, max_tokens=1500):
     """
-    Extract a coherent answer from relevant chunks using a more sophisticated approach:
-    1. Group chunks by document to maintain context
-    2. Use similarity to select the most relevant sections
-    3. Construct a more coherent narrative
+    Extract a coherent answer from relevant chunks, using Vertex AI if available.
     """
     if not relevant_chunks:
         return "I couldn't find any relevant information to answer your question."
     
+    # If Vertex AI integration is enabled and available, use it
+    global vertex_connector
+    if USE_VERTEX_AI and vertex_ai_available and vertex_connector:
+        try:
+            logger.info("Using Vertex AI for response generation")
+            return vertex_connector.generate_response(query, relevant_chunks)
+        except Exception as e:
+            logger.error(f"Error using Vertex AI for response: {str(e)}")
+            logger.info("Falling back to default extraction method")
+            # Fall back to default method if Vertex AI fails
+    
+    # Default extraction method - the original implementation
     # Group chunks by document
     docs_chunks = {}
     for chunk in relevant_chunks:
@@ -558,6 +704,7 @@ def format_response(query, answer, relevant_chunks):
 def initialize_knowledge_base(force=False):
     """Initialize the knowledge base from Confluence or load from cache"""
     global document_chunks, chunk_embeddings, document_metadata, last_refresh_time
+    global vertex_connector, langchain_vector_store
     
     with knowledge_base_lock:
         # If we have a valid cache and aren't forcing a refresh, use it
@@ -572,6 +719,32 @@ def initialize_knowledge_base(force=False):
                 document_metadata is not None):
                 logger.info(f"Successfully loaded knowledge base from cache: {len(document_chunks)} chunks")
                 last_refresh_time = datetime.now()
+                
+                # Initialize Vertex AI if enabled
+                if USE_VERTEX_AI and vertex_ai_available and GCP_PROJECT_ID:
+                    try:
+                        logger.info("Initializing Vertex AI integration...")
+                        # Convert document chunks to format expected by Langchain
+                        documents = []
+                        for i, chunk in enumerate(document_chunks):
+                            documents.append({
+                                'content': chunk,
+                                'metadata': document_metadata[i]
+                            })
+                        
+                        # Create Langchain components
+                        langchain_vector_store, vertex_connector = create_qa_chain_with_vertex(
+                            project_id=GCP_PROJECT_ID,
+                            documents=documents,
+                            cache_dir=LANGCHAIN_CACHE_DIR,
+                            location=GCP_LOCATION,
+                            model_name=VERTEX_MODEL
+                        )
+                        logger.info("Vertex AI integration initialized successfully")
+                    except Exception as e:
+                        logger.error(f"Error initializing Vertex AI: {str(e)}")
+                        vertex_connector = None
+                
                 return True
             else:
                 logger.warning("Cache seems corrupt or incomplete, rebuilding knowledge base")
@@ -590,6 +763,31 @@ def initialize_knowledge_base(force=False):
             ConfluenceCache.save_to_cache(document_chunks, "chunks")
             ConfluenceCache.save_to_cache(chunk_embeddings, "embeddings")
             ConfluenceCache.save_to_cache(document_metadata, "metadata")
+            
+            # Initialize Vertex AI if enabled
+            if USE_VERTEX_AI and vertex_ai_available and GCP_PROJECT_ID:
+                try:
+                    logger.info("Initializing Vertex AI integration...")
+                    # Convert document chunks to format expected by Langchain
+                    langchain_documents = []
+                    for i, chunk in enumerate(document_chunks):
+                        langchain_documents.append({
+                            'content': chunk,
+                            'metadata': document_metadata[i]
+                        })
+                    
+                    # Create Langchain components
+                    langchain_vector_store, vertex_connector = create_qa_chain_with_vertex(
+                        project_id=GCP_PROJECT_ID,
+                        documents=langchain_documents,
+                        cache_dir=LANGCHAIN_CACHE_DIR,
+                        location=GCP_LOCATION,
+                        model_name=VERTEX_MODEL
+                    )
+                    logger.info("Vertex AI integration initialized successfully")
+                except Exception as e:
+                    logger.error(f"Error initializing Vertex AI: {str(e)}")
+                    vertex_connector = None
             
             elapsed_time = time.time() - start_time
             logger.info(f"Knowledge base initialized in {elapsed_time:.2f} seconds with {len(document_chunks)} chunks")
@@ -980,6 +1178,27 @@ if __name__ == "__main__":
     import signal
     import sys
     
+    print("\n=== Starting Confluence Knowledge Bot ===")
+    print(f"Current working directory: {os.getcwd()}")
+    print(f"Python version: {sys.version}")
+    
+    # Check for required environment variables
+    required_vars = ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "CONFLUENCE_URL",
+                      "CONFLUENCE_USERNAME", "CONFLUENCE_API_TOKEN"]
+    missing_vars = [var for var in required_vars if not os.environ.get(var)]
+    
+    if missing_vars:
+        print(f"ERROR: Missing required environment variables: {', '.join(missing_vars)}")
+        sys.exit(1)
+    
+    print(f"Vertex AI integration enabled: {USE_VERTEX_AI}")
+    if USE_VERTEX_AI:
+        print(f"GCP Project ID: {GCP_PROJECT_ID or 'Not set'}")
+        print(f"Vertex AI model: {VERTEX_MODEL}")
+        
+        if not GCP_PROJECT_ID:
+            print("WARNING: GCP_PROJECT_ID is not set but USE_VERTEX_AI is enabled")
+    
     # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -987,13 +1206,21 @@ if __name__ == "__main__":
     # Load previous state
     load_state()
     
+    print("Initializing knowledge base...")
     # Ensure the knowledge base is initialized
     initialize_knowledge_base()
+    
+    if USE_VERTEX_AI and vertex_ai_available:
+        if vertex_connector:
+            print("✅ Vertex AI integration successfully initialized")
+        else:
+            print("❌ Vertex AI integration failed to initialize")
     
     # Start the automatic refresh thread
     refresh_event.clear()
     auto_refresh_thread = threading.Thread(target=auto_refresh_knowledge_base, daemon=True)
     auto_refresh_thread.start()
     
+    print("Starting Slack bot...")
     logger.info("Starting Confluence Knowledge Bot...")
     SocketModeHandler(app, SLACK_APP_TOKEN).start()
