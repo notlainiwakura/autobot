@@ -533,8 +533,8 @@ def process_page(page):
         # Get the page ID
         page_id = page['id']
         
-        # Get page content with expanded body
-        page_content = confluence.get_page_by_id(page_id, expand='body.storage,version,history,metadata.labels')
+        # Get page content with expanded body and space information
+        page_content = confluence.get_page_by_id(page_id, expand='body.storage,version,history,metadata.labels,space')
         
         # Extract HTML content
         html_content = page_content['body']['storage']['value']
@@ -552,20 +552,27 @@ def process_page(page):
         updated_date = page_content.get('version', {}).get('when', '')
         last_updater = page_content.get('version', {}).get('by', {}).get('displayName', 'Unknown')
         
+        # Get space key from expanded page content
+        space_key = page_content.get('space', {}).get('key', page.get('space', {}).get('key', 'Unknown'))
+        
         # Create document with enhanced metadata
         doc = {
             'content': text_content,
             'metadata': {
-                'title': page.get('title', 'Untitled'),
+                'title': page_content.get('title', page.get('title', 'Untitled')),
                 'id': page_id,
-                'url': f"{CONFLUENCE_URL}/pages/viewpage.action?pageId={page_id}",
-                'space': page.get('space', {}).get('name', 'Unknown'),
-                'space_key': page.get('space', {}).get('key', 'Unknown'),
+                'url': f"{CONFLUENCE_URL}/wiki/spaces/{space_key}/pages/{page_id}",
+                'space': page_content.get('space', {}).get('name', page.get('space', {}).get('name', 'Unknown')),
+                'space_key': space_key,
                 'labels': labels,
                 'last_updated': updated_date,
                 'last_updater': last_updater
             }
         }
+        
+        # Add debugging log
+        logger.info(f"Created URL for page {page_id} in space {space_key}: {doc['metadata']['url']}")
+        
         return doc
     except Exception as e:
         logger.error(f"Error processing page {page.get('title', 'Unknown')}: {str(e)}")
