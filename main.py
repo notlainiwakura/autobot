@@ -54,7 +54,7 @@ if os.environ.get("USE_VERTEX_AI", "false").lower() == "true":
         
         # Define the VertexAI connector class inline
         class VertexAIConnector:
-            def __init__(self, project_id, location="us-central1", model_name="gemini-1.5-pro",
+            def __init__(self, project_id, location="us-central1", model_name="gemini-1.5-ultra-001",
                          temperature=0.1, max_output_tokens=8000):
                 self.project_id = project_id
                 self.location = location
@@ -71,23 +71,30 @@ if os.environ.get("USE_VERTEX_AI", "false").lower() == "true":
                     max_output_tokens=max_output_tokens,
                     convert_system_message_to_human=True
                 )
-                
-                # Default prompt template for QA
+
                 self.prompt_template = PromptTemplate(
-                    template="""You are a helpful assistant that answers questions based on Confluence documentation.
-                    
-Context information is below:
---------------------------
-{context}
---------------------------
+                    template="""You are a precise information assistant that provides only the most relevant details from Confluence.
 
-Given the context information and not prior knowledge, answer the following question:
-{question}
+                Context information:
+                --------------------------
+                {context}
+                --------------------------
 
-If the answer is not explicitly contained in the provided context, say "I don't have enough information to answer this question confidently."
-Answer in a professional, clear, and concise manner. Format the response with markdown when appropriate.
-Include key facts and details from the context, but keep the overall answer concise.
-""",
+                Based on the above context, answer this question concisely:
+                {question}
+
+                IMPORTANT GUIDELINES:
+                - Focus on answering the specific question ONLY
+                - Omit any information not directly relevant to the question
+                - Use simple, direct language with no unnecessary words
+                - Organize your response as a single unified answer, not a collection of excerpts
+                - If you don't have enough information, simply say "This specific information isn't available in our documentation."
+                - Don't include any source references or mention where the information comes from
+                - Format your answer for instant clarity and actionability
+                - Prioritize step-by-step instructions when applicable
+
+                Your goal is to provide the single most helpful, focused answer possible.
+                """,
                     input_variables=["context", "question"]
                 )
             
@@ -683,43 +690,41 @@ def create_embeddings():
     
     logger.info(f"Created {len(chunk_embeddings)} embeddings")
 
-def search_documents(query, top_k=TOP_K_RESULTS, min_score=0.25):
-    """
-    Search for the most relevant document chunks with a minimum similarity threshold.
-    """
+
+def search_documents(query, top_k=3, min_score=0.4):  # Reduced top_k, increased min_score
+    """Search for only the most relevant document chunks with higher threshold."""
     # Encode the query
     query_embedding = model.encode([query])[0]
-    
+
     # Calculate similarity scores
     similarity_scores = cosine_similarity([query_embedding], chunk_embeddings)[0]
-    
-    # Get top-k results above the minimum score
+
+    # Get top-k results above the higher minimum score
     indices_and_scores = [(idx, similarity_scores[idx]) for idx in range(len(similarity_scores))
-                           if similarity_scores[idx] >= min_score]
-    
+                          if similarity_scores[idx] >= min_score]
+
     # Sort by score (descending)
     indices_and_scores.sort(key=lambda x: x[1], reverse=True)
-    
+
     # Take top_k
     top_indices_and_scores = indices_and_scores[:top_k]
-    
+
     results = []
     for idx, score in top_indices_and_scores:
         results.append({
             'chunk': document_chunks[idx],
             'metadata': document_metadata[idx],
-            'score': float(score)  # Convert numpy float to Python float for JSON serialization
+            'score': float(score)
         })
-    
+
     return results
 
-def extract_answer(query, relevant_chunks, max_tokens=1500):
-    """
-    Extract a coherent answer from relevant chunks, using Vertex AI if available.
-    """
+
+def extract_answer(query, relevant_chunks, max_tokens=800):  # Reduced max_tokens
+    """Extract a more focused answer from relevant chunks."""
     if not relevant_chunks:
-        return "I couldn't find any relevant information to answer your question."
-    
+        return "I couldn't find relevant information to answer your question."
+
     # If Vertex AI integration is enabled and available, use it
     global vertex_connector
     if USE_VERTEX_AI and vertex_ai_available and vertex_connector:
@@ -729,75 +734,48 @@ def extract_answer(query, relevant_chunks, max_tokens=1500):
         except Exception as e:
             logger.error(f"Error using Vertex AI for response: {str(e)}")
             logger.info("Falling back to default extraction method")
-            # Fall back to default method if Vertex AI fails
-    
-    # Default extraction method - the original implementation
-    # Group chunks by document
-    docs_chunks = {}
-    for chunk in relevant_chunks:
-        doc_id = chunk['metadata']['id']
-        if doc_id not in docs_chunks:
-            docs_chunks[doc_id] = []
-        docs_chunks[doc_id].append(chunk)
-    
-    # Sort chunks within each document by score
-    for doc_id in docs_chunks:
-        docs_chunks[doc_id].sort(key=lambda x: x['score'], reverse=True)
-    
+
+    # Enhanced focus: Use only the top 2 most relevant chunks
+    top_chunks = sorted(relevant_chunks, key=lambda x: x['score'], reverse=True)[:2]
+
     # Get query embedding for sentence-level similarity
     query_embedding = model.encode([query])[0]
-    
-    # Create an answer that flows better by prioritizing document coherence
-    answer_parts = []
-    token_count = 0
-    
-    # First take the highest scoring chunk from each document
-    for doc_id, chunks in sorted(docs_chunks.items(), key=lambda x: x[1][0]['score'], reverse=True):
-        top_chunk = chunks[0]
-        
-        # Extract key sentences that are most relevant to the query
-        sentences = sent_tokenize(top_chunk['chunk'])
+
+    # Extract only the most relevant sentences from these chunks
+    all_sentences = []
+    for chunk in top_chunks:
+        sentences = sent_tokenize(chunk['chunk'])
         sentence_embeddings = model.encode(sentences)
         sentence_scores = cosine_similarity([query_embedding], sentence_embeddings)[0]
-        
-        # Sort sentences by relevance
-        sorted_sent_indices = np.argsort(sentence_scores)[::-1]
-        
-        # Add document title as a subheading
-        doc_title = top_chunk['metadata']['title']
-        answer_part = f"From \"{doc_title}\":\n"
-        part_token_count = count_tokens(answer_part)
-        
-        # Add the most relevant sentences, respecting the token limit
-        added_sentences = set()  # Track sentences we've already added
-        for idx in sorted_sent_indices:
-            sentence = sentences[idx]
-            sentence_token_count = count_tokens(sentence)
-            
-            # Skip if we've seen this sentence or it would exceed our budget
-            if sentence in added_sentences or token_count + part_token_count + sentence_token_count > max_tokens:
-                continue
-                
-            answer_part += sentence + " "
-            part_token_count += sentence_token_count
-            added_sentences.add(sentence)
-        
-            # Only add this part if it has actual content beyond the heading
-        if part_token_count > count_tokens(f"From \"{doc_title}\":\n"):
-            answer_parts.append(answer_part)
-            token_count += part_token_count
-            
-            # Break if we've reached the token limit
-            if token_count >= max_tokens:
-                break
-    
-    # Combine all parts into a coherent answer
-    if answer_parts:
-        combined_answer = "\n\n".join(answer_parts)
-        return combined_answer
-    else:
-        return "I found some potentially relevant documents, but couldn't extract a specific answer to your question."
 
+        # Get only sentences with high relevance scores
+        for i, score in enumerate(sentence_scores):
+            if score > 0.5:  # Higher threshold for sentence relevance
+                all_sentences.append((sentences[i], score, chunk['metadata']['title']))
+
+    # Sort by relevance score
+    all_sentences.sort(key=lambda x: x[1], reverse=True)
+
+    # Take only the top sentences that fit within our token budget
+    final_sentences = []
+    token_count = 0
+
+    for sentence, _, _ in all_sentences:
+        sentence_tokens = count_tokens(sentence)
+        if token_count + sentence_tokens <= max_tokens:
+            final_sentences.append(sentence)
+            token_count += sentence_tokens
+        else:
+            break
+
+    if not final_sentences:
+        # If no sentences met our high relevance threshold, take the single highest scoring chunk
+        return "Based on our documentation, " + top_chunks[0]['chunk']
+
+    # Combine sentences into a cohesive answer
+    answer = " ".join(final_sentences)
+
+    return answer
 def format_response(query, answer, relevant_chunks):
     """Format the response for Slack with improved readability"""
     # Format answer text
