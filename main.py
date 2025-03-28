@@ -829,21 +829,23 @@ def search_documents(query, top_k=5, min_score=0.4):
 
 
 def extract_answer(query, relevant_chunks, max_tokens=1200):
-    """Extract a coherent answer from relevant chunks, prioritizing single-source information."""
+    """Extract a coherent answer from relevant chunks with improved formatting and structure."""
     if not relevant_chunks:
         return "I couldn't find relevant information to answer your question."
 
-    # If Vertex AI integration is enabled and available, use it
+    # If Vertex AI integration is enabled and available, use it with improved prompting
     global vertex_connector
     if USE_VERTEX_AI and vertex_ai_available and vertex_connector:
         try:
             logger.info("Using Vertex AI for response generation")
+            # Update the prompt template to emphasize better formatting
+            _update_vertex_connector_prompt()
             return vertex_connector.generate_response(query, relevant_chunks)
         except Exception as e:
             logger.error(f"Error using Vertex AI for response: {str(e)}")
-            logger.info("Falling back to default extraction method")
+            logger.info("Falling back to improved extraction method")
 
-    # Group chunks by document ID
+    # Group chunks by document ID to maintain coherence
     doc_id_to_chunks = {}
     for chunk in relevant_chunks:
         doc_id = chunk['metadata']['id']
@@ -851,56 +853,69 @@ def extract_answer(query, relevant_chunks, max_tokens=1200):
             doc_id_to_chunks[doc_id] = []
         doc_id_to_chunks[doc_id].append(chunk)
 
-    # Find document with most chunks
-    best_doc_id = max(doc_id_to_chunks.keys(), key=lambda x: len(doc_id_to_chunks[x]))
-    best_doc_chunks = doc_id_to_chunks[best_doc_id]
+    # Sort documents by highest scoring chunk
+    doc_scores = {}
+    for doc_id, chunks in doc_id_to_chunks.items():
+        max_score = max(chunk['score'] for chunk in chunks)
+        doc_scores[doc_id] = max_score
 
-    # Sort best document chunks by score
-    best_doc_chunks.sort(key=lambda x: x['score'], reverse=True)
+    sorted_doc_ids = sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True)
 
-    # Combine chunks from best document into single context
-    context = "\n".join([chunk['chunk'] for chunk in best_doc_chunks])
+    # Prepare context with structured document sections
+    contexts = []
+    current_tokens = 0
 
-    # If context is too long, we'll need to be selective
-    if count_tokens(context) > max_tokens:
-        # Get query embedding for sentence-level relevance
-        query_embedding = model.encode([query])[0]
+    for doc_id in sorted_doc_ids:
+        if current_tokens >= max_tokens:
+            break
 
-        # Split into sentences and compute relevance
-        sentences = sent_tokenize(context)
-        sentence_embeddings = model.encode(sentences)
-        sentence_scores = cosine_similarity([query_embedding], sentence_embeddings)[0]
+        chunks = doc_id_to_chunks[doc_id]
+        # Sort chunks by score
+        sorted_chunks = sorted(chunks, key=lambda x: x['score'], reverse=True)
 
-        # Sort sentences by relevance
-        sorted_sentences = [(s, score) for s, score in zip(sentences, sentence_scores)]
-        sorted_sentences.sort(key=lambda x: x[1], reverse=True)
+        # Get document metadata from highest scoring chunk
+        metadata = sorted_chunks[0]['metadata']
+        title = metadata.get('title', 'Unknown Document')
 
-        # Take most relevant sentences up to token limit
-        selected_sentences = []
-        token_count = 0
+        # Combine chunks from this document
+        doc_text = []
+        for chunk in sorted_chunks:
+            chunk_text = chunk['chunk'].strip()
+            chunk_tokens = count_tokens(chunk_text)
 
-        for sentence, _ in sorted_sentences:
-            sentence_tokens = count_tokens(sentence)
-            if token_count + sentence_tokens <= max_tokens:
-                selected_sentences.append(sentence)
-                token_count += sentence_tokens
+            if current_tokens + chunk_tokens <= max_tokens:
+                doc_text.append(chunk_text)
+                current_tokens += chunk_tokens
             else:
+                # If we can't add the whole chunk, stop adding from this document
                 break
 
-        context = " ".join(selected_sentences)
+        if doc_text:
+            # Only add section title if multiple documents are included
+            section_header = f"## {title}\n\n" if len(doc_id_to_chunks) > 1 else ""
+            contexts.append(f"{section_header}{process_text_formatting(''.join(doc_text))}")
+
+    context = "\n\n".join(contexts)
 
     # Prepare the prompt for Vertex AI model
     system_prompt = f"""
-    Answer the following question precisely using ONLY the information in the context below.
+    Answer the following question with careful attention to formatting and clarity.
+    Use ONLY the information in the context below.
     If the context doesn't contain relevant information, say "I don't have specific information on this topic."
-    Focus only on information directly relevant to the question.
-    Use clear, natural language, and organize information logically.
 
     CONTEXT:
     {context}
 
     QUESTION:
     {query}
+
+    FORMATTING GUIDELINES:
+    1. Maintain proper list formatting and numbering
+    2. Preserve paragraph breaks and headings
+    3. Ensure instructions are complete and clearly presented
+    4. Use markdown formatting for better readability
+    5. Present different sections with clear separation
+    6. Make sure numbered lists have proper indentation and spacing
     """
 
     if USE_VERTEX_AI and vertex_ai_available:
@@ -914,16 +929,87 @@ def extract_answer(query, relevant_chunks, max_tokens=1200):
         except Exception as e:
             logger.error(f"Error calling Vertex AI directly: {str(e)}")
 
-    # Fallback method if Vertex AI isn't available or fails
-    # Simple approach: return the most relevant chunk with a clean intro
-    top_chunk = best_doc_chunks[0]['chunk']
+    # If Vertex AI isn't available or fails, use improved fallback
+    return process_text_formatting(context)
 
-    # Clean up by removing section headings and formatting
-    cleaned_chunk = re.sub(r'#{1,6}\s+.*?\n', '', top_chunk)  # Remove markdown headings
-    cleaned_chunk = re.sub(r'\*\*.*?\*\*', '', cleaned_chunk)  # Remove bold text markers
 
-    return f"Based on our documentation: {cleaned_chunk}"
+def process_text_formatting(text):
+    """Clean up formatting issues in text."""
+    # Replace multiple newlines with double newlines
+    processed = re.sub(r'\n{3,}', '\n\n', text)
 
+    # Fix list formatting
+    lines = processed.split('\n')
+    processed_lines = []
+    in_list = False
+    list_indent = 0
+
+    for i, line in enumerate(lines):
+        # Check if line is a list item
+        list_match = re.match(r'^(\s*)(\d+)\.(\s*)(.+)$', line)
+        if list_match:
+            # This is a list item, ensure proper spacing
+            spaces, number, existing_space, content = list_match.groups()
+            proper_space = ' ' if not existing_space else existing_space
+            processed_lines.append(f"{spaces}{number}.{proper_space}{content}")
+            in_list = True
+            list_indent = len(spaces)
+        elif in_list and line.strip() and i > 0:
+            # This might be a continuation of a list item
+            if not lines[i - 1].endswith(('.', ':', '?')) and not line.startswith(' ' * (list_indent + 2)):
+                # Add indentation for continuation text
+                processed_lines.append(' ' * (list_indent + 2) + line)
+            else:
+                processed_lines.append(line)
+        else:
+            processed_lines.append(line)
+            if not line.strip():
+                in_list = False
+
+    # Join lines back together
+    processed = '\n'.join(processed_lines)
+
+    # Fix markdown formatting
+    processed = re.sub(r'\*\*\s+', '**', processed)  # Fix bold text spacing
+    processed = re.sub(r'\s+\*\*', '**', processed)
+
+    # Fix broken links
+    processed = re.sub(r'\[([^\]]+)\]\s+\(([^)]+)\)', r'[\1](\2)', processed)
+
+    return processed
+
+
+def _update_vertex_connector_prompt():
+    """Update the Vertex AI prompt template to emphasize better formatting."""
+    if vertex_connector:
+        vertex_connector.prompt_template = PromptTemplate(
+            template="""You are a precise knowledge assistant that delivers well-formatted, structured answers based on Confluence documentation.
+
+Context information:
+--------------------------
+{context}
+--------------------------
+
+Question: {question}
+
+Instructions:
+1. Answer the specific question asked using ONLY information from the context
+2. Present a SINGLE, coherent response that flows naturally
+3. Maintain proper formatting for all lists, steps, and instructions:
+   - Ensure numbered lists have proper spacing and indentation
+   - Preserve paragraph breaks and section headings
+   - Format code snippets, commands, and technical details properly
+4. If a procedure has steps, ensure they are clearly numbered and complete
+5. If multiple procedures exist (e.g., for different platforms), separate them with clear headings
+6. Use consistent terminology throughout your response
+7. Prefer information from a single document when possible for coherence
+8. If the answer isn't in the context, say "I don't have specific information on this topic."
+9. Never reference document names or sources within your answer text
+
+Your response should be a polished, properly formatted answer that could appear in an official guide.
+""",
+            input_variables=["context", "question"]
+        )
 
 def format_response(query, answer, relevant_chunks):
     """Format the response with only the most relevant source."""
