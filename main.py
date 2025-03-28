@@ -1601,7 +1601,7 @@ def handle_dm_messages(body, say, client):
             return
         
         # Extract answer
-        answer = extract_answer(question, relevant_chunks)
+        answer = extract_answer_with_structure(question, relevant_chunks)
         
         # Format response
         formatted_response = format_response(question, answer, relevant_chunks)
@@ -1730,14 +1730,574 @@ def signal_handler(sig, frame):
     logger.info("Cleanup complete, exiting")
     sys.exit(0)
 
-def _update_vertex_connector_prompt():
+
+def extract_answer_with_structure(query, relevant_chunks, max_tokens=1200):
     """
-    Update the Vertex AI prompt template with advanced instructions to improve response quality.
-    Focuses on formatting, completeness, and coherence.
+    Extract an answer with improved content structure, clear section headers,
+    and smooth transitions between different parts.
     """
+    if not relevant_chunks:
+        return "I couldn't find relevant information to answer your question."
+
+    # Process and categorize the content for better structure
+    structured_content = structure_content_by_category(query, relevant_chunks)
+
+    # If Vertex AI integration is enabled and available, use it with structured prompting
+    global vertex_connector
+    if USE_VERTEX_AI and vertex_ai_available and vertex_connector:
+        try:
+            logger.info("Using Vertex AI for response generation with structured prompting")
+
+            # Update prompt template to emphasize structure
+            _update_vertex_connector_prompt_for_structure()
+
+            # Generate response with structured content
+            response = vertex_connector.generate_response(query, structured_content['chunks'])
+
+            # Apply post-processing to ensure structural integrity
+            final_response = enhance_response_structure(response, structured_content['outline'])
+
+            return final_response
+
+        except Exception as e:
+            logger.error(f"Error using Vertex AI with structured prompting: {str(e)}")
+            logger.info("Falling back to manual structure generation")
+
+            # Fallback to manual generation of structured response
+            return generate_structured_response(query, structured_content)
+
+    # Fallback to manual generation if Vertex AI isn't available
+    return generate_structured_response(query, structured_content)
+
+
+def structure_content_by_category(query, chunks):
+    """
+    Analyze chunks and categorize them for structured presentation.
+    Returns a dictionary with categorized content and a suggested outline.
+    """
+    # Initialize structure
+    structured_content = {
+        'chunks': [],  # Will store processed chunks
+        'categories': {},  # Will store content by category
+        'outline': {},  # Will store suggested section outline
+        'sources': set(),  # Will track unique source documents
+        'platforms': set(),  # Will track platform-specific content (iOS, Android, etc.)
+        'has_procedure': False,  # Flag if content contains procedural steps
+        'query_type': determine_query_type(query)
+    }
+
+    # Identify the type of content needed based on query
+    query_keywords = extract_query_keywords(query)
+
+    # First pass: identify categories and platforms
+    categorize_content(chunks, structured_content, query_keywords)
+
+    # Second pass: arrange chunks based on categories and create logical structure
+    create_content_structure(chunks, structured_content)
+
+    # Create transition text between sections
+    add_section_transitions(structured_content)
+
+    return structured_content
+
+
+def determine_query_type(query):
+    """Determine the type of query to guide response structure."""
+    query_lower = query.lower()
+
+    if any(kw in query_lower for kw in ['how to', 'steps', 'procedure', 'guide', 'tutorial', 'setup', 'configure']):
+        return 'procedure'
+    elif any(kw in query_lower for kw in ['what is', 'definition', 'explain', 'describe', 'tell me about']):
+        return 'explanation'
+    elif any(kw in query_lower for kw in ['compare', 'difference', 'versus', 'vs', 'pros and cons']):
+        return 'comparison'
+    elif any(kw in query_lower for kw in ['troubleshoot', 'fix', 'solve', 'issue', 'error', 'problem']):
+        return 'troubleshooting'
+    else:
+        return 'general'
+
+
+def extract_query_keywords(query):
+    """Extract important keywords from the query."""
+    # Remove common stop words
+    stop_words = set(['a', 'an', 'the', 'is', 'are', 'in', 'on', 'at', 'for', 'to', 'with', 'by'])
+
+    # Tokenize and extract important words
+    words = re.findall(r'\b\w+\b', query.lower())
+    keywords = [word for word in words if word not in stop_words and len(word) > 2]
+
+    # Extract phrases that might be important (e.g., "Charles Proxy")
+    phrases = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', query)
+
+    return set(keywords + phrases)
+
+
+def categorize_content(chunks, structured_content, query_keywords):
+    """Categorize content chunks based on their content."""
+    # Platform detection patterns
+    platform_patterns = {
+        'android': r'\bandroid\b',
+        'ios': r'\bios\b|\biphone\b|\bipad\b|\bapple\s+device',
+        'windows': r'\bwindows\b',
+        'mac': r'\bmac\b|\bmacos\b|\bosx\b',
+        'linux': r'\blinux\b|\bubuntu\b|\bdebian\b',
+        'web': r'\bweb\b|\bbrowser\b|\bchrome\b|\bfirefox\b|\bsafari\b'
+    }
+
+    # Content category patterns
+    category_patterns = {
+        'prerequisites': r'\bprerequisite|\brequirement|\bbefore\s+you\s+begin|\bneeded\b',
+        'installation': r'\binstall|\bdownload|\bsetup\b|\bconfiguration\b',
+        'basic_usage': r'\bbasic\s+usage|\bget\s+started|\bquick\s+start|\bintroduction\b',
+        'advanced_usage': r'\badvanced|\bexpert|\bcustom\b',
+        'troubleshooting': r'\btroubleshoot|\bissue|\berror|\bproblem|\bdebug\b|\bfix\b',
+        'reference': r'\breference|\bapi|\bcommand|\bparameter\b|\boption\b'
+    }
+
+    # Check each chunk for categories and platforms
+    for chunk in chunks:
+        chunk_text = chunk['chunk'].lower()
+        chunk_categories = set()
+        chunk_platforms = set()
+
+        # Check for platforms
+        for platform, pattern in platform_patterns.items():
+            if re.search(pattern, chunk_text, re.IGNORECASE):
+                chunk_platforms.add(platform)
+                structured_content['platforms'].add(platform)
+
+        # Check for content categories
+        for category, pattern in category_patterns.items():
+            if re.search(pattern, chunk_text, re.IGNORECASE):
+                chunk_categories.add(category)
+
+        # Check for procedural content (numbered steps)
+        if re.search(r'(?:^|\n)\s*\d+\.\s+', chunk['chunk']):
+            chunk_categories.add('procedure')
+            structured_content['has_procedure'] = True
+
+        # Add source document
+        source_doc = chunk['metadata'].get('title', 'Unknown')
+        structured_content['sources'].add(source_doc)
+
+        # Store categorization with the chunk
+        chunk_info = chunk.copy()
+        chunk_info['categories'] = chunk_categories
+        chunk_info['platforms'] = chunk_platforms
+
+        # Calculate relevance boost for chunks that match query keywords
+        keyword_matches = sum(1 for kw in query_keywords if kw in chunk_text)
+        chunk_info['keyword_relevance'] = keyword_matches / len(query_keywords) if query_keywords else 0
+
+        structured_content['chunks'].append(chunk_info)
+
+        # Add to category dictionary
+        for category in chunk_categories:
+            if category not in structured_content['categories']:
+                structured_content['categories'][category] = []
+            structured_content['categories'][category].append(chunk_info)
+
+
+def create_content_structure(chunks, structured_content):
+    """Create a logical content structure based on categories and query type."""
+    query_type = structured_content['query_type']
+    categories = structured_content['categories']
+    platforms = structured_content['platforms']
+
+    # Initialize outline with an introduction
+    outline = {'introduction': 'Introduction'}
+
+    # Build appropriate structure based on query type
+    if query_type == 'procedure':
+        # For procedures, organize by step sequence
+        if 'prerequisites' in categories:
+            outline['prerequisites'] = 'Prerequisites'
+
+        if 'installation' in categories:
+            outline['installation'] = 'Installation and Setup'
+
+        outline['procedure'] = 'Step-by-Step Guide'
+
+        # If multiple platforms, create subsections for each
+        if len(platforms) > 1:
+            for platform in platforms:
+                platform_key = f"procedure_{platform}"
+                platform_name = platform.capitalize()
+                outline[platform_key] = f"Steps for {platform_name}"
+
+        if 'troubleshooting' in categories:
+            outline['troubleshooting'] = 'Troubleshooting Common Issues'
+
+        outline['verification'] = 'Verification and Next Steps'
+
+    elif query_type == 'explanation':
+        # For explanations, organize by concept
+        outline['overview'] = 'Overview'
+
+        if 'basic_usage' in categories:
+            outline['basic_usage'] = 'Basic Usage'
+
+        if 'advanced_usage' in categories:
+            outline['advanced_usage'] = 'Advanced Features'
+
+        if 'reference' in categories:
+            outline['reference'] = 'Technical Reference'
+
+    elif query_type == 'comparison':
+        # For comparisons, organize by comparison points
+        outline['overview'] = 'Overview of Options'
+
+        # If comparing platforms, create sections for each
+        if len(platforms) > 1:
+            for platform in platforms:
+                platform_key = f"comparison_{platform}"
+                platform_name = platform.capitalize()
+                outline[platform_key] = f"{platform_name} Features"
+
+        outline['summary'] = 'Summary and Recommendations'
+
+    elif query_type == 'troubleshooting':
+        # For troubleshooting, organize by issue and solution
+        outline['problem_overview'] = 'Problem Overview'
+
+        if 'basic_usage' in categories:
+            outline['basic_checks'] = 'Basic Checks'
+
+        outline['solutions'] = 'Solutions'
+
+        # If platform-specific issues, create subsections
+        if len(platforms) > 1:
+            for platform in platforms:
+                platform_key = f"solutions_{platform}"
+                platform_name = platform.capitalize()
+                outline[platform_key] = f"Solutions for {platform_name}"
+
+        outline['prevention'] = 'Prevention Tips'
+
+    else:  # general query
+        # For general queries, use a simple structure
+        outline['overview'] = 'Overview'
+
+        if structured_content['has_procedure']:
+            outline['procedure'] = 'Procedures'
+
+        if len(platforms) > 1:
+            outline['platforms'] = 'Platform-Specific Information'
+
+        if 'reference' in categories:
+            outline['reference'] = 'Reference Information'
+
+    # Add conclusion
+    outline['conclusion'] = 'Conclusion'
+
+    # Store the outline
+    structured_content['outline'] = outline
+
+
+def add_section_transitions(structured_content):
+    """Add transition text between sections for smoother flow."""
+    outline = structured_content['outline']
+    query_type = structured_content['query_type']
+
+    transitions = {}
+
+    # Create appropriate transitions based on query type and outline
+    if query_type == 'procedure':
+        # Transitions for procedural content
+        if 'prerequisites' in outline and 'installation' in outline:
+            transitions[
+                'prerequisites_to_installation'] = "Once you have all the prerequisites ready, let's proceed with the installation process."
+
+        if 'installation' in outline and 'procedure' in outline:
+            transitions[
+                'installation_to_procedure'] = "After completing the installation, follow these steps to use the software:"
+
+        # For multi-platform content
+        platforms = structured_content['platforms']
+        if len(platforms) > 1:
+            for i, platform in enumerate(platforms):
+                next_platform = list(platforms)[i + 1] if i < len(platforms) - 1 else None
+                if next_platform:
+                    transitions[
+                        f"procedure_{platform}_to_procedure_{next_platform}"] = f"If you're using {next_platform.capitalize()} instead, follow these steps:"
+
+        if 'procedure' in outline and 'troubleshooting' in outline:
+            transitions[
+                'procedure_to_troubleshooting'] = "If you encounter any issues during this process, refer to these troubleshooting tips:"
+
+        if 'troubleshooting' in outline and 'verification' in outline:
+            transitions[
+                'troubleshooting_to_verification'] = "After resolving any issues, here's how to verify everything is working correctly:"
+
+    elif query_type == 'explanation':
+        # Transitions for explanatory content
+        if 'overview' in outline and 'basic_usage' in outline:
+            transitions['overview_to_basic_usage'] = "Let's look at how to use this in basic scenarios:"
+
+        if 'basic_usage' in outline and 'advanced_usage' in outline:
+            transitions[
+                'basic_usage_to_advanced_usage'] = "Once you're comfortable with the basics, you can explore these advanced features:"
+
+        if 'advanced_usage' in outline and 'reference' in outline:
+            transitions[
+                'advanced_usage_to_reference'] = "For complete technical details, refer to this reference information:"
+
+    elif query_type == 'comparison':
+        # Transitions for comparison content
+        if 'overview' in outline:
+            platforms = structured_content['platforms']
+            if len(platforms) > 1:
+                transitions['overview_to_comparison'] = "Let's compare the key features across different platforms:"
+
+        # Add transitions between platform comparisons
+        platforms = structured_content['platforms']
+        for i, platform in enumerate(platforms):
+            next_platform = list(platforms)[i + 1] if i < len(platforms) - 1 else None
+            if next_platform:
+                transitions[
+                    f"comparison_{platform}_to_comparison_{next_platform}"] = f"Now, let's examine the features for {next_platform.capitalize()}:"
+
+        if any(k.startswith('comparison_') for k in outline) and 'summary' in outline:
+            transitions['comparison_to_summary'] = "To summarize the key differences and make recommendations:"
+
+    # Add a final transition to conclusion for all types
+    last_section = list(outline.keys())[-2]  # -2 because the last one is conclusion
+    transitions[f"{last_section}_to_conclusion"] = "In conclusion:"
+
+    # Store the transitions
+    structured_content['transitions'] = transitions
+
+
+def generate_structured_response(query, structured_content):
+    """
+    Generate a structured response based on the content structure.
+    This is used as a fallback when Vertex AI is not available.
+    """
+    outline = structured_content['outline']
+    transitions = structured_content['transitions']
+    chunks = structured_content['chunks']
+
+    # Sort chunks by relevance score
+    sorted_chunks = sorted(chunks, key=lambda x: (x['score'] + x.get('keyword_relevance', 0)), reverse=True)
+
+    # Initialize response sections
+    sections = {}
+    for section_key, section_title in outline.items():
+        sections[section_key] = {
+            'title': section_title,
+            'content': []
+        }
+
+    # Fill in content for each section based on relevance and categories
+    for section_key in outline.keys():
+        # Skip introduction and conclusion - we'll generate these separately
+        if section_key in ['introduction', 'conclusion']:
+            continue
+
+        # Find chunks relevant to this section
+        relevant_chunks = []
+
+        # For procedure sections
+        if section_key == 'procedure' or section_key.startswith('procedure_'):
+            relevant_chunks = [c for c in sorted_chunks if 'procedure' in c['categories']]
+
+            # For platform-specific procedures
+            if section_key.startswith('procedure_'):
+                platform = section_key.split('_')[1]
+                relevant_chunks = [c for c in relevant_chunks if platform in c['platforms']]
+
+        # For other specific sections
+        elif section_key in structured_content['categories']:
+            relevant_chunks = structured_content['categories'][section_key]
+
+        # For platform-specific sections
+        elif '_' in section_key:
+            category, platform = section_key.split('_')
+            if category in structured_content['categories']:
+                category_chunks = structured_content['categories'][category]
+                relevant_chunks = [c for c in category_chunks if platform in c['platforms']]
+
+        # For general sections, use most relevant chunks not yet assigned
+        else:
+            # Get chunks that haven't been assigned to other sections
+            assigned_chunks = set()
+            for s_key, s_data in sections.items():
+                if s_key != section_key:
+                    assigned_chunks.update(id(c) for c in s_data['content'])
+
+            relevant_chunks = [c for c in sorted_chunks if id(c) not in assigned_chunks][:3]
+
+        # Add chunks to section
+        sections[section_key]['content'] = relevant_chunks
+
+    # Generate introduction
+    query_type = structured_content['query_type']
+    sources = structured_content['sources']
+    source_text = list(sources)[0] if sources else "our documentation"
+
+    intro_text = ""
+    if query_type == 'procedure':
+        intro_text = f"Here's a complete guide on {query} based on {source_text}. Follow these instructions carefully for best results."
+    elif query_type == 'explanation':
+        intro_text = f"Let me explain {query} based on information from {source_text}."
+    elif query_type == 'comparison':
+        intro_text = f"Here's a detailed comparison for {query} based on {source_text}."
+    elif query_type == 'troubleshooting':
+        intro_text = f"Here are solutions for {query} based on {source_text}."
+    else:
+        intro_text = f"Here's the information about {query} from {source_text}."
+
+    sections['introduction']['content'] = [{'chunk': intro_text, 'score': 1.0}]
+
+    # Generate conclusion
+    conclusion_text = "This information should help you with " + query + ". "
+    if query_type == 'procedure':
+        conclusion_text += "By following these steps carefully, you should be able to complete the process successfully."
+    elif query_type == 'troubleshooting':
+        conclusion_text += "If you continue to experience issues after trying these solutions, please contact technical support for further assistance."
+    else:
+        conclusion_text += "For more detailed information, refer to the complete documentation."
+
+    sections['conclusion']['content'] = [{'chunk': conclusion_text, 'score': 1.0}]
+
+    # Build final response with sections and transitions
+    response = ""
+    section_keys = list(outline.keys())
+
+    for i, section_key in enumerate(section_keys):
+        section = sections[section_key]
+
+        # Add section header
+        if section_key != 'introduction':  # Skip header for introduction
+            response += f"\n\n## {section['title']}\n\n"
+
+        # Add section content
+        if section_key in ['introduction', 'conclusion']:
+            # For intro and conclusion, use our generated text
+            response += section['content'][0]['chunk']
+        else:
+            # For other sections, use relevant chunks
+            if section['content']:
+                # Combine chunks into coherent text
+                combined_text = combine_chunks_to_coherent_text(section['content'], section_key)
+                response += combined_text
+            else:
+                # If no content, add placeholder
+                response += f"Information about {section['title']} is not available in the current documentation."
+
+        # Add transition to next section if available
+        if i < len(section_keys) - 1:
+            next_section_key = section_keys[i + 1]
+            transition_key = f"{section_key}_to_{next_section_key}"
+
+            if transition_key in transitions:
+                response += f"\n\n{transitions[transition_key]}"
+
+    # Clean up formatting
+    return process_text_formatting(response)
+
+
+def combine_chunks_to_coherent_text(chunks, section_key):
+    """Combine chunks into coherent text for a section."""
+    # Sort chunks by score
+    sorted_chunks = sorted(chunks, key=lambda x: x['score'], reverse=True)
+
+    # For procedural sections, try to maintain numbered steps
+    if section_key == 'procedure' or section_key.startswith('procedure_'):
+        # Extract and organize numbered steps
+        steps = extract_numbered_steps(sorted_chunks)
+
+        if steps:
+            # Format the steps in order
+            step_text = "\n\n"
+            current_step = 1
+
+            for step_num, step_content in sorted(steps.items()):
+                # If there's a gap in numbering, add a note
+                if step_num > current_step:
+                    step_text += f"_(Note: Steps {current_step} to {step_num - 1} are not available in the documentation)_\n\n"
+
+                step_text += f"{step_num}. {step_content}\n\n"
+                current_step = step_num + 1
+
+            return step_text
+
+    # For other sections, combine chunks with proper transitions
+    combined_text = ""
+
+    for i, chunk in enumerate(sorted_chunks):
+        chunk_text = chunk['chunk'].strip()
+
+        # Skip if this chunk is too similar to already included content
+        if i > 0 and is_content_redundant(chunk_text, combined_text):
+            continue
+
+        # Add appropriate separator based on content
+        if combined_text:
+            # Check if this chunk appears to continue from previous content
+            if is_continuation(sorted_chunks[i - 1]['chunk'], chunk_text):
+                combined_text += " " + chunk_text
+            else:
+                combined_text += "\n\n" + chunk_text
+        else:
+            combined_text = chunk_text
+
+    return combined_text
+
+
+def extract_numbered_steps(chunks):
+    """Extract numbered steps from chunks, organizing them by step number."""
+    steps = {}
+
+    # Step pattern matching
+    step_pattern = r'(?:^|\n)\s*(\d+)\.(?:\s+)(.+?)(?=(?:\n\s*\d+\.)|$)'
+
+    for chunk in chunks:
+        chunk_text = chunk['chunk']
+
+        # Find all numbered steps in this chunk
+        for match in re.finditer(step_pattern, chunk_text, re.DOTALL):
+            step_num = int(match.group(1))
+            step_content = match.group(2).strip()
+
+            # Only add if we don't already have this step or if the new content is better
+            if step_num not in steps or len(step_content) > len(steps[step_num]):
+                steps[step_num] = step_content
+
+    return steps
+
+
+def is_content_redundant(new_text, existing_text):
+    """Check if new text is redundant with existing content."""
+    # Simple redundancy check - if 70% of sentences are already present
+    new_sentences = set(s.strip() for s in re.split(r'[.!?]', new_text) if s.strip())
+    existing_sentences = set(s.strip() for s in re.split(r'[.!?]', existing_text) if s.strip())
+
+    overlap_count = len(new_sentences.intersection(existing_sentences))
+    redundancy_ratio = overlap_count / len(new_sentences) if new_sentences else 0
+
+    return redundancy_ratio > 0.7
+
+
+def is_continuation(previous_text, current_text):
+    """Check if current text appears to be a continuation of previous text."""
+    # Check if previous text ends mid-sentence
+    if not previous_text.strip().endswith(('.', '!', '?', ':', ';')):
+        return True
+
+    # Check if current text starts with lowercase or connecting words
+    if re.match(r'^\s*[a-z]', current_text) or re.match(
+            r'^\s*(and|or|but|however|therefore|thus|moreover|furthermore|additionally)', current_text, re.IGNORECASE):
+        return True
+
+    return False
+
+
+def _update_vertex_connector_prompt_for_structure():
+    """Update the Vertex AI prompt template to emphasize structure and transitions."""
     if vertex_connector:
         vertex_connector.prompt_template = PromptTemplate(
-            template="""You are an expert technical documentation writer crafting precise, complete answers from Confluence documentation.
+            template="""You are an expert technical writer creating highly structured documentation from Confluence sources.
 
 Context information:
 --------------------------
@@ -1746,55 +2306,102 @@ Context information:
 
 Question: {question}
 
-I NEED YOU TO FOLLOW THESE INSTRUCTIONS EXACTLY:
+I NEED YOU TO CREATE A PERFECTLY STRUCTURED RESPONSE:
 
-CONTENT REQUIREMENTS:
-1. Answer using ONLY information from the provided context
-2. Create a SINGLE, UNIFIED response that reads like professional documentation
-3. When describing a process or setup:
-   - Include EVERY required step with correct numbering
-   - Maintain the exact sequence of steps as presented in the context
-   - Preserve all specific values (URLs, IPs, ports, etc.) exactly as given
-   - Include all command line instructions, configuration parameters, and options
-4. If the context contains multiple approaches (e.g., for different platforms):
-   - Clearly separate each approach with descriptive headings
-   - Present each approach in full without mixing steps
+CONTENT STRUCTURE REQUIREMENTS:
+1. Organize your response with CLEAR SECTION HEADERS (##) for each main section
+2. Begin with a brief introduction (no header needed for this section)
+3. Arrange content in a logical, progressive order based on complexity or sequence
+4. When combining information from different sources:
+   * Use section headers to clearly delineate different topics
+   * Add smooth transitions between sections to maintain flow
+   * Ensure ideas connect logically from one section to the next
+5. End with a concise conclusion section that summarizes key points
 
-FORMATTING REQUIREMENTS:
-1. Use markdown formatting consistently and professionally
-2. Format numbered lists properly:
-   - Ensure proper indentation for multi-line steps
-   - Maintain proper spacing between number and content
-   - Preserve nested lists with correct indentation hierarchy
-3. Use section headings (## and ###) to organize complex answers
-4. Format code blocks, commands, and configuration snippets with proper syntax
-5. Use bold text for UI elements and important terms
+SECTION TRANSITIONS:
+1. Add explicit transition sentences between major sections
+2. Use connective phrases like "Now that we've covered X, let's look at Y"
+3. Show the relationship between sections (e.g., "Building on these concepts...")
+4. For sequential procedures, use clear sequence indicators (First, Next, Finally)
+5. When switching between platforms or approaches, clearly signal the change
 
-CLARITY AND COMPLETENESS:
-1. For UI navigation instructions:
-   - Specify EXACTLY which buttons, menus, or options to click
-   - Describe exactly where to find each UI element
-   - Include any required waiting periods or verification steps
-2. For technical terms and concepts:
-   - Include brief explanations of specialized terminology
-   - Clarify ambiguous terms or abbreviations
-3. For inputs and parameters:
-   - Clearly indicate which fields are required vs. optional
-   - Specify acceptable formats and ranges for inputs
+FORMATTING AND CLARITY:
+1. Use consistent formatting throughout the entire response
+2. Maintain proper list formatting and numbering across sections
+3. Use subsections (###) for complex topics that need further organization
+4. Format technical elements consistently (code, commands, parameters)
+5. For multi-platform instructions, clearly label each platform section
 
-QUALITY CONTROL:
-1. NEVER truncate or abbreviate instructions with "..." or similar
-2. NEVER skip steps or assume prior knowledge
-3. If you detect missing or inconsistent information in the context:
-   - Explicitly note the gap: "Note: The documentation doesn't specify [missing information]"
-   - Provide the most likely interpretation based on context
-4. NEVER reference the source documents or mention Confluence
-
-Your answer should be complete and ready for immediate use without requiring additional information.
+Your response should read as ONE COHESIVE DOCUMENT with perfect flow between sections, not as fragments from different sources.
 """,
             input_variables=["context", "question"]
         )
 
+
+def enhance_response_structure(response, outline):
+    """
+    Enhance the structure of a response from Vertex AI by adding missing
+    section headers and transitions if needed.
+    """
+    if not response:
+        return "I couldn't generate a proper response based on the available information."
+
+    # Check if the response already has section headers
+    has_headers = bool(re.search(r'^\s*#{2,3}\s+.+$', response, re.MULTILINE))
+
+    # If no headers and we have multiple sections in our outline, add them
+    if not has_headers and len(outline) > 3:  # More than intro, one section, conclusion
+        structured_response = ""
+        section_keys = list(outline.keys())
+
+        # Extract paragraphs from response
+        paragraphs = re.split(r'\n{2,}', response)
+
+        # Assign paragraphs to sections based on content analysis
+        current_section_idx = 0
+        for i, paragraph in enumerate(paragraphs):
+            # Skip empty paragraphs
+            if not paragraph.strip():
+                continue
+
+            # First paragraph is introduction (no header)
+            if i == 0:
+                structured_response += paragraph + "\n\n"
+                current_section_idx = 1
+                continue
+
+            # Last paragraph is conclusion
+            if i == len(paragraphs) - 1 and len(paragraphs) > 3:
+                structured_response += f"\n\n## {outline['conclusion']}\n\n{paragraph}"
+                break
+
+            # Middle paragraphs get appropriate section headers
+            if current_section_idx < len(section_keys) - 1:  # Skip intro and conclusion
+                section_key = section_keys[current_section_idx]
+                if section_key not in ['introduction', 'conclusion']:
+                    structured_response += f"\n\n## {outline[section_key]}\n\n{paragraph}"
+                    current_section_idx += 1
+                else:
+                    # Skip to the next non-intro/conclusion section
+                    while (current_section_idx < len(section_keys) and
+                           section_keys[current_section_idx] in ['introduction', 'conclusion']):
+                        current_section_idx += 1
+
+                    if current_section_idx < len(section_keys):
+                        section_key = section_keys[current_section_idx]
+                        structured_response += f"\n\n## {outline[section_key]}\n\n{paragraph}"
+                        current_section_idx += 1
+                    else:
+                        # If we've run out of sections, add without header
+                        structured_response += "\n\n" + paragraph
+            else:
+                # If we've run out of sections, add without header
+                structured_response += "\n\n" + paragraph
+
+        return structured_response
+    else:
+        # Response already has good structure or is too short to need it
+        return response
 
 def extract_answer_with_enhanced_prompting(query, relevant_chunks, max_tokens=1200):
     """
