@@ -5,6 +5,7 @@ import numpy as np
 import pickle
 import time
 import hashlib
+import math
 from datetime import datetime, timedelta
 from pathlib import Path
 from slack_bolt import App
@@ -237,6 +238,8 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", 4))  # Thread pool size for para
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 512))   # Default chunk size
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 128))  # Default chunk overlap
 TOP_K_RESULTS = int(os.environ.get("TOP_K_RESULTS", 5))  # Default number of results to return
+MAX_PAGES_PER_SPACE = int(os.environ.get("MAX_PAGES_PER_SPACE", 500))  # Maximum pages to fetch per space
+
 
 # Google Cloud & Vertex AI settings
 USE_VERTEX_AI = os.environ.get("USE_VERTEX_AI", "false").lower() == "true"
@@ -481,8 +484,9 @@ def send_long_message(say, text, thread_ts=None, blocks=None):
         
         say(text=chunk, thread_ts=thread_ts)
 
+
 def fetch_confluence_content():
-    """Fetch content from Confluence and prepare it for chunking"""
+    """Fetch content from Confluence and prepare it for chunking with proper pagination handling"""
     all_pages = []
 
     if SPACE_KEY:
@@ -491,9 +495,39 @@ def fetch_confluence_content():
         for space in space_keys:
             logger.info(f"Fetching pages from space: {space}")
             try:
-                space_pages = confluence.get_all_pages_from_space(space, limit=500, expand="body.storage")
-                logger.info(f"Fetched {len(space_pages)} pages from space {space}")
-                all_pages.extend(space_pages)
+                # Initialize variables for pagination
+                start = 0
+                page_limit = 100  # This is the API's internal limit per request
+                all_space_pages = []
+                has_more = True
+
+                # Keep fetching pages until we get all of them or reach our maximum limit
+                while has_more and start < MAX_PAGES_PER_SPACE:
+                    # Get a batch of pages with pagination parameters
+                    logger.info(f"Fetching pages {start} to {start + page_limit} from space {space}")
+                    batch = confluence.get_all_pages_from_space(
+                        space,
+                        start=start,
+                        limit=page_limit,
+                        expand="body.storage"
+                    )
+
+                    # If we got fewer results than the limit, we've reached the end
+                    if len(batch) < page_limit:
+                        has_more = False
+
+                    # Add pages to our collection
+                    all_space_pages.extend(batch)
+
+                    # Update start for next batch
+                    start += len(batch)
+
+                    # If no results were returned, we're done
+                    if not batch:
+                        has_more = False
+
+                logger.info(f"Fetched {len(all_space_pages)} pages from space {space}")
+                all_pages.extend(all_space_pages)
             except Exception as e:
                 logger.error(f"Error fetching pages from space {space}: {str(e)}")
     else:
@@ -502,13 +536,44 @@ def fetch_confluence_content():
         try:
             all_spaces = confluence.get_all_spaces()
             logger.info(f"Found {len(all_spaces)} spaces")
-            
+
             for space in all_spaces:
                 try:
                     logger.info(f"Fetching pages from space: {space['key']}")
-                    space_pages = confluence.get_all_pages_from_space(space['key'], limit=500)
-                    logger.info(f"Fetched {len(space_pages)} pages from space {space['key']}")
-                    all_pages.extend(space_pages)
+
+                    # Initialize variables for pagination
+                    start = 0
+                    page_limit = 100  # This is the API's internal limit per request
+                    all_space_pages = []
+                    has_more = True
+
+                    # Keep fetching pages until we get all of them or reach our maximum limit
+                    while has_more and start < MAX_PAGES_PER_SPACE:
+                        # Get a batch of pages with pagination parameters
+                        logger.info(f"Fetching pages {start} to {start + page_limit} from space {space['key']}")
+                        batch = confluence.get_all_pages_from_space(
+                            space['key'],
+                            start=start,
+                            limit=page_limit,
+                            expand="body.storage"
+                        )
+
+                        # If we got fewer results than the limit, we've reached the end
+                        if len(batch) < page_limit:
+                            has_more = False
+
+                        # Add pages to our collection
+                        all_space_pages.extend(batch)
+
+                        # Update start for next batch
+                        start += len(batch)
+
+                        # If no results were returned, we're done
+                        if not batch:
+                            has_more = False
+
+                    logger.info(f"Fetched {len(all_space_pages)} pages from space {space['key']}")
+                    all_pages.extend(all_space_pages)
                 except Exception as e:
                     logger.error(f"Error fetching pages from space {space['key']}: {str(e)}")
         except Exception as e:
@@ -521,7 +586,7 @@ def fetch_confluence_content():
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Submit all page processing tasks
         future_to_page = {executor.submit(process_page, page): page for page in all_pages}
-        
+
         # Collect results as they complete
         for future in future_to_page:
             try:
@@ -691,37 +756,80 @@ def create_embeddings():
     logger.info(f"Created {len(chunk_embeddings)} embeddings")
 
 
-def search_documents(query, top_k=3, min_score=0.4):  # Reduced top_k, increased min_score
-    """Search for only the most relevant document chunks with higher threshold."""
+def search_documents(query, top_k=5, min_score=0.4):
+    """Search for document chunks and prioritize documents with multiple relevant chunks."""
     # Encode the query
     query_embedding = model.encode([query])[0]
 
     # Calculate similarity scores
     similarity_scores = cosine_similarity([query_embedding], chunk_embeddings)[0]
 
-    # Get top-k results above the higher minimum score
-    indices_and_scores = [(idx, similarity_scores[idx]) for idx in range(len(similarity_scores))
-                          if similarity_scores[idx] >= min_score]
+    # Get results above minimum score
+    candidate_indices = [idx for idx in range(len(similarity_scores)) if similarity_scores[idx] >= min_score]
 
-    # Sort by score (descending)
-    indices_and_scores.sort(key=lambda x: x[1], reverse=True)
-
-    # Take top_k
-    top_indices_and_scores = indices_and_scores[:top_k]
-
-    results = []
-    for idx, score in top_indices_and_scores:
-        results.append({
-            'chunk': document_chunks[idx],
-            'metadata': document_metadata[idx],
-            'score': float(score)
+    # Group by document ID
+    doc_id_to_chunks = {}
+    for idx in candidate_indices:
+        doc_id = document_metadata[idx]['id']
+        if doc_id not in doc_id_to_chunks:
+            doc_id_to_chunks[doc_id] = []
+        doc_id_to_chunks[doc_id].append({
+            'idx': idx,
+            'score': float(similarity_scores[idx])
         })
 
+    # Calculate document scores by combining chunk scores
+    # Documents with multiple relevant chunks get boosted
+    doc_scores = {}
+    for doc_id, chunks in doc_id_to_chunks.items():
+        # Calculate average score
+        avg_score = sum(chunk['score'] for chunk in chunks) / len(chunks)
+        # Boost score based on number of relevant chunks (logarithmic scaling)
+        boost = 1 + (math.log10(len(chunks)) * 0.5)
+        doc_scores[doc_id] = avg_score * boost
+
+    # Sort documents by combined score
+    sorted_doc_ids = sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True)
+
+    # Take top documents and their chunks
+    results = []
+    docs_selected = 0
+
+    # First try to get everything from a single document if it has enough content
+    best_doc_id = sorted_doc_ids[0] if sorted_doc_ids else None
+    if best_doc_id and len(doc_id_to_chunks[best_doc_id]) >= 2:
+        # Sort chunks by score
+        sorted_chunks = sorted(doc_id_to_chunks[best_doc_id], key=lambda x: x['score'], reverse=True)
+        # Take top chunks from best document
+        for chunk in sorted_chunks[:3]:  # Limit to 3 chunks from same document
+            idx = chunk['idx']
+            results.append({
+                'chunk': document_chunks[idx],
+                'metadata': document_metadata[idx],
+                'score': chunk['score']
+            })
+        docs_selected = 1
+    else:
+        # If single best document doesn't have enough content, take top chunks from top 2 docs
+        for doc_id in sorted_doc_ids[:2]:
+            docs_selected += 1
+            # Sort chunks by score
+            sorted_chunks = sorted(doc_id_to_chunks[doc_id], key=lambda x: x['score'], reverse=True)
+            # Take top chunks from this document
+            for chunk in sorted_chunks[:2]:  # Limit to 2 chunks per document
+                idx = chunk['idx']
+                results.append({
+                    'chunk': document_chunks[idx],
+                    'metadata': document_metadata[idx],
+                    'score': chunk['score']
+                })
+
+    logger.info(f"Selected {len(results)} chunks from {docs_selected} documents")
     return results
 
 
-def extract_answer(query, relevant_chunks, max_tokens=800):  # Reduced max_tokens
-    """Extract a more focused answer from relevant chunks."""
+def extract_answer(query, relevant_chunks, max_tokens=1200):
+    """Extract a coherent answer from relevant chunks, prioritizing single-source information."""
     if not relevant_chunks:
         return "I couldn't find relevant information to answer your question."
 
@@ -735,60 +843,101 @@ def extract_answer(query, relevant_chunks, max_tokens=800):  # Reduced max_token
             logger.error(f"Error using Vertex AI for response: {str(e)}")
             logger.info("Falling back to default extraction method")
 
-    # Enhanced focus: Use only the top 2 most relevant chunks
-    top_chunks = sorted(relevant_chunks, key=lambda x: x['score'], reverse=True)[:2]
+    # Group chunks by document ID
+    doc_id_to_chunks = {}
+    for chunk in relevant_chunks:
+        doc_id = chunk['metadata']['id']
+        if doc_id not in doc_id_to_chunks:
+            doc_id_to_chunks[doc_id] = []
+        doc_id_to_chunks[doc_id].append(chunk)
 
-    # Get query embedding for sentence-level similarity
-    query_embedding = model.encode([query])[0]
+    # Find document with most chunks
+    best_doc_id = max(doc_id_to_chunks.keys(), key=lambda x: len(doc_id_to_chunks[x]))
+    best_doc_chunks = doc_id_to_chunks[best_doc_id]
 
-    # Extract only the most relevant sentences from these chunks
-    all_sentences = []
-    for chunk in top_chunks:
-        sentences = sent_tokenize(chunk['chunk'])
+    # Sort best document chunks by score
+    best_doc_chunks.sort(key=lambda x: x['score'], reverse=True)
+
+    # Combine chunks from best document into single context
+    context = "\n".join([chunk['chunk'] for chunk in best_doc_chunks])
+
+    # If context is too long, we'll need to be selective
+    if count_tokens(context) > max_tokens:
+        # Get query embedding for sentence-level relevance
+        query_embedding = model.encode([query])[0]
+
+        # Split into sentences and compute relevance
+        sentences = sent_tokenize(context)
         sentence_embeddings = model.encode(sentences)
         sentence_scores = cosine_similarity([query_embedding], sentence_embeddings)[0]
 
-        # Get only sentences with high relevance scores
-        for i, score in enumerate(sentence_scores):
-            if score > 0.5:  # Higher threshold for sentence relevance
-                all_sentences.append((sentences[i], score, chunk['metadata']['title']))
+        # Sort sentences by relevance
+        sorted_sentences = [(s, score) for s, score in zip(sentences, sentence_scores)]
+        sorted_sentences.sort(key=lambda x: x[1], reverse=True)
 
-    # Sort by relevance score
-    all_sentences.sort(key=lambda x: x[1], reverse=True)
+        # Take most relevant sentences up to token limit
+        selected_sentences = []
+        token_count = 0
 
-    # Take only the top sentences that fit within our token budget
-    final_sentences = []
-    token_count = 0
+        for sentence, _ in sorted_sentences:
+            sentence_tokens = count_tokens(sentence)
+            if token_count + sentence_tokens <= max_tokens:
+                selected_sentences.append(sentence)
+                token_count += sentence_tokens
+            else:
+                break
 
-    for sentence, _, _ in all_sentences:
-        sentence_tokens = count_tokens(sentence)
-        if token_count + sentence_tokens <= max_tokens:
-            final_sentences.append(sentence)
-            token_count += sentence_tokens
-        else:
-            break
+        context = " ".join(selected_sentences)
 
-    if not final_sentences:
-        # If no sentences met our high relevance threshold, take the single highest scoring chunk
-        return "Based on our documentation, " + top_chunks[0]['chunk']
+    # Prepare the prompt for Vertex AI model
+    system_prompt = f"""
+    Answer the following question precisely using ONLY the information in the context below.
+    If the context doesn't contain relevant information, say "I don't have specific information on this topic."
+    Focus only on information directly relevant to the question.
+    Use clear, natural language, and organize information logically.
 
-    # Combine sentences into a cohesive answer
-    answer = " ".join(final_sentences)
+    CONTEXT:
+    {context}
 
-    return answer
+    QUESTION:
+    {query}
+    """
+
+    if USE_VERTEX_AI and vertex_ai_available:
+        try:
+            # Direct call to Vertex AI with focused prompt
+            response = vertex_connector.llm.invoke(system_prompt)
+            if hasattr(response, 'content'):
+                return response.content.strip()
+            elif isinstance(response, str):
+                return response.strip()
+        except Exception as e:
+            logger.error(f"Error calling Vertex AI directly: {str(e)}")
+
+    # Fallback method if Vertex AI isn't available or fails
+    # Simple approach: return the most relevant chunk with a clean intro
+    top_chunk = best_doc_chunks[0]['chunk']
+
+    # Clean up by removing section headings and formatting
+    cleaned_chunk = re.sub(r'#{1,6}\s+.*?\n', '', top_chunk)  # Remove markdown headings
+    cleaned_chunk = re.sub(r'\*\*.*?\*\*', '', cleaned_chunk)  # Remove bold text markers
+
+    return f"Based on our documentation: {cleaned_chunk}"
+
+
 def format_response(query, answer, relevant_chunks):
-    """Format the response for Slack with improved readability"""
+    """Format the response with only the most relevant source."""
     # Format answer text
     formatted_answer = answer.replace("\n\n", "\n").strip()
-    
-    # Prepare source citations using a set to avoid duplicates but maintain order
-    seen_sources = {}
-    for chunk in relevant_chunks:
-        url = chunk['metadata'].get('url')
-        title = chunk['metadata'].get('title')
-        space = chunk['metadata'].get('space')
-        last_updated = chunk['metadata'].get('last_updated', '')
-        
+
+    # Find the most relevant document (one with highest scoring chunk)
+    if relevant_chunks:
+        top_chunk = max(relevant_chunks, key=lambda x: x['score'])
+        url = top_chunk['metadata'].get('url')
+        title = top_chunk['metadata'].get('title')
+        space = top_chunk['metadata'].get('space')
+        last_updated = top_chunk['metadata'].get('last_updated', '')
+
         # Format the date if available
         date_str = ""
         if last_updated:
@@ -799,20 +948,18 @@ def format_response(query, answer, relevant_chunks):
             except:
                 # If parsing fails, use the raw string
                 date_str = f", last updated {last_updated}"
-        
-        if url and title and url not in seen_sources:
-            seen_sources[url] = f"*{title}* ({space}{date_str})\n{url}"
-    
-    # Build the related wikis section
-    related_wikis = "\n".join([f"{idx+1}. {info}" for idx, info in enumerate(seen_sources.values())])
-    
+
+        source_info = f"*{title}* ({space}{date_str})\n{url}" if url and title else ""
+    else:
+        source_info = ""
+
     # Build the final response
     formatted_response = f"*Your Query:* {query}\n\n"
     formatted_response += "*Answer:*\n" + formatted_answer + "\n\n"
-    
-    if related_wikis:
-        formatted_response += "*Sources:*\n" + related_wikis
-    
+
+    if source_info:
+        formatted_response += "*Source:*\n" + source_info
+
     return formatted_response
 
 def initialize_knowledge_base(force=False):
@@ -1287,6 +1434,33 @@ def signal_handler(sig, frame):
     save_state()
     logger.info("Cleanup complete, exiting")
     sys.exit(0)
+
+def _update_vertex_connector_prompt():
+    if vertex_connector:
+        vertex_connector.prompt_template = PromptTemplate(
+            template="""You are a precise knowledge assistant that delivers focused answers based on Confluence documentation.
+
+Context information:
+--------------------------
+{context}
+--------------------------
+
+Question: {question}
+
+Instructions:
+1. Answer ONLY the specific question asked based on the context provided
+2. Present information from a SINGLE document perspective when possible
+3. Use natural, clear language with a professional tone
+4. Focus only on the most relevant details, omitting tangential information
+5. If multiple documents are referenced in the context, prioritize the one with the most relevant information
+6. If the answer isn't found in the context, say "I don't have specific information on this topic."
+7. Format your response as a cohesive, properly structured answer
+8. Never reference document names or sources within your answer
+
+Your response should read as a single, authoritative answer from the company's official documentation.
+""",
+            input_variables=["context", "question"]
+        )
 
 # Initialize the app and start it using Socket Mode
 if __name__ == "__main__":
