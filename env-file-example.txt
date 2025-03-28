@@ -1,0 +1,32 @@
+# Required Slack settings
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_APP_TOKEN=xapp-your-app-token
+
+# Confluence API settings
+CONFLUENCE_URL=https://yourcompany.atlassian.net
+CONFLUENCE_USERNAME=your-email@company.com
+CONFLUENCE_API_TOKEN=your-api-token
+CONFLUENCE_SPACE_KEY=SPACE1,SPACE2,SPACE3
+
+# Caching and performance settings
+CACHE_DIR=cache
+REFRESH_INTERVAL_HOURS=24
+MAX_WORKERS=4
+MAX_PAGES_PER_SPACE=500
+
+# Chunking and search settings
+CHUNK_SIZE=512
+CHUNK_OVERLAP=128
+TOP_K_RESULTS=5
+EMBEDDING_MODEL=msmarco-distilbert-base-v4
+
+# Message handling settings
+MESSAGE_CACHE_TTL=60
+THREAD_TIMEOUT=300
+
+# Optional: Google Vertex AI Integration
+USE_VERTEX_AI=false
+GCP_PROJECT_ID=your-project-id
+GCP_LOCATION=us-central1
+VERTEX_MODEL=gemini-2.5-pro
+LANGCHAIN_CACHE_DIR=langchain_cache

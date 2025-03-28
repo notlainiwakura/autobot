@@ -1,13 +1,19 @@
-slack-bolt>=1.17.0
+# Core dependencies
+slack-bolt>=1.16.0
+python-dotenv>=0.21.0
 atlassian-python-api>=3.32.0
+numpy>=1.23.5
+nltk>=3.7
 html2text>=2020.1.16
 sentence-transformers>=2.2.2
-scikit-learn>=1.2.2
-nltk>=3.8.1
-python-dotenv>=1.0.0
-numpy>=1.24.3
-tiktoken>=0.5.1
-google-cloud-aiplatform>=1.28.0
-langchain>=0.0.266
+scikit-learn>=1.2.0
+tiktoken>=0.4.0
+
+# Google Cloud & Vertex AI (optional)
 langchain-google-vertexai>=0.0.1
+langchain>=0.0.267
+langchain-community>=0.0.2
 faiss-cpu>=1.7.4
+
+# Other utilities
+tqdm>=4.64.1
