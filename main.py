@@ -1220,10 +1220,84 @@ Your response must be a self-contained guide that someone could follow successfu
             input_variables=["context", "question"]
         )
 
+
+def clean_markdown_for_slack(text):
+    """
+    Clean markdown syntax in text to make it display correctly in Slack.
+    Transforms markdown headers and formatting to Slack-friendly format.
+    """
+    if not text:
+        return text
+
+    lines = text.split('\n')
+    result_lines = []
+
+    # Process line by line for better control
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Handle headers (## Heading) - convert to bold with spacing
+        header_match = re.match(r'^\s*(#{2,3})\s+(.+?)$', line)
+        if header_match:
+            # Add empty line before header if not at the beginning and previous line isn't empty
+            if i > 0 and lines[i - 1].strip():
+                result_lines.append('')
+
+            # Add the header as bold text
+            result_lines.append(f"*{header_match.group(2)}*")
+
+            # Add empty line after header if next line isn't empty
+            if i < len(lines) - 1 and lines[i + 1].strip():
+                result_lines.append('')
+
+        # Handle bold text (**text**) - ensure proper bold formatting for Slack
+        elif '**' in line:
+            # Replace **text** with *text* (Slack bold)
+            processed_line = re.sub(r'\*\*([^*]+?)\*\*', r'*\1*', line)
+
+            # If the entire line is bold and looks like a subheading, add spacing
+            if re.match(r'^\s*\*\*[^*]+?\*\*\s*$', line):
+                # Add empty line before if not at the beginning and previous line isn't empty
+                if i > 0 and lines[i - 1].strip():
+                    result_lines.append('')
+
+                # Add the bold line (converted to Slack format)
+                result_lines.append(processed_line)
+
+                # Add empty line after if next line isn't empty
+                if i < len(lines) - 1 and lines[i + 1].strip():
+                    result_lines.append('')
+            else:
+                # Regular bold text within a line
+                result_lines.append(processed_line)
+        else:
+            # Keep other lines as is
+            result_lines.append(line)
+
+        i += 1
+
+    # Join lines back together
+    result = '\n'.join(result_lines)
+
+    # Fix markdown links to display properly
+    # [text](url) -> text (url)
+    result = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1 (\2)', result)
+
+    # Fix code blocks for better Slack display
+    # ```code``` -> `code`
+    result = re.sub(r'```(?:\w+)?\n(.+?)\n```', r'`\1`', result, flags=re.DOTALL)
+
+    return result
+
+
 def format_response(query, answer, relevant_chunks):
     """Format the response with only the most relevant source."""
-    # Format answer text
-    formatted_answer = answer.replace("\n\n", "\n").strip()
+    # Format answer text, preserving more paragraph breaks for readability
+    formatted_answer = answer.strip()
+
+    # Clean markdown for better display in Slack
+    formatted_answer = clean_markdown_for_slack(formatted_answer)
 
     # Find the most relevant document (one with highest scoring chunk)
     if relevant_chunks:
@@ -2137,7 +2211,7 @@ def generate_structured_response(query, structured_content):
 
     intro_text = ""
     if query_type == 'procedure':
-        intro_text = f"Here's a complete guide on {query} based on {source_text}. Follow these instructions carefully for best results."
+        intro_text = f"Here's a complete guide on {query}. Follow these instructions carefully for best results."
     elif query_type == 'explanation':
         intro_text = f"Let me explain {query} based on information from {source_text}."
     elif query_type == 'comparison':
@@ -2530,6 +2604,7 @@ def process_chunk_for_prompting(text):
 def postprocess_vertex_response(response):
     """
     Post-process the Vertex AI response to fix any remaining formatting issues.
+    Includes specific handling for Slack-compatible formatting.
     """
     if not response:
         return "I couldn't generate a proper response based on the available information."
@@ -2544,6 +2619,14 @@ def postprocess_vertex_response(response):
     # Fix any broken markdown links
     processed = re.sub(r'\[([^\]]+)\]\s+\(([^)]+)\)', r'[\1](\2)', processed)
 
+    # Format bold sections properly - ensure no double asterisks
+    # First, normalize double asterisks spacing (remove internal spaces)
+    processed = re.sub(r'\*\*\s+', '**', processed)
+    processed = re.sub(r'\s+\*\*', '**', processed)
+
+    # Convert **text** to *text* for Slack
+    processed = re.sub(r'\*\*([^*]+?)\*\*', r'*\1*', processed)
+
     # Fix code block formatting
     processed = re.sub(r'```\s+([a-zA-Z0-9]+)', r'```\1', processed)
 
@@ -2553,7 +2636,6 @@ def postprocess_vertex_response(response):
         processed = f"# Response\n\n{processed}"
 
     return processed
-
 
 def is_procedural_question(query):
     """Check if the query is asking for a procedure or how-to."""
