@@ -1,4 +1,4 @@
-# Confluence Knowledge Bot
+# AutoBot
 
 A Slack bot that uses embeddings and natural language processing to answer questions based on your Confluence knowledge base. The bot maintains a local cache of Confluence content for quick and private answers.
 
