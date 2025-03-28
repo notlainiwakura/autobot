@@ -829,7 +829,7 @@ def search_documents(query, top_k=5, min_score=0.4):
 
 
 def extract_answer(query, relevant_chunks, max_tokens=1200):
-    """Extract a coherent answer from relevant chunks with improved formatting and structure."""
+    """Extract a coherent answer with complete context and improved formatting."""
     if not relevant_chunks:
         return "I couldn't find relevant information to answer your question."
 
@@ -838,70 +838,45 @@ def extract_answer(query, relevant_chunks, max_tokens=1200):
     if USE_VERTEX_AI and vertex_ai_available and vertex_connector:
         try:
             logger.info("Using Vertex AI for response generation")
-            # Update the prompt template to emphasize better formatting
+            # Update the prompt template to emphasize completeness
             _update_vertex_connector_prompt()
-            return vertex_connector.generate_response(query, relevant_chunks)
+
+            # Instead of sending individual chunks, send complete context for more coherence
+            enhanced_chunks = enhance_context_completeness(relevant_chunks, query, max_tokens)
+            return vertex_connector.generate_response(query, enhanced_chunks)
         except Exception as e:
             logger.error(f"Error using Vertex AI for response: {str(e)}")
             logger.info("Falling back to improved extraction method")
 
+    # Create enhanced context with better completeness
+    enhanced_chunks = enhance_context_completeness(relevant_chunks, query, max_tokens)
+
     # Group chunks by document ID to maintain coherence
     doc_id_to_chunks = {}
-    for chunk in relevant_chunks:
+    for chunk in enhanced_chunks:
         doc_id = chunk['metadata']['id']
         if doc_id not in doc_id_to_chunks:
             doc_id_to_chunks[doc_id] = []
         doc_id_to_chunks[doc_id].append(chunk)
 
-    # Sort documents by highest scoring chunk
-    doc_scores = {}
-    for doc_id, chunks in doc_id_to_chunks.items():
-        max_score = max(chunk['score'] for chunk in chunks)
-        doc_scores[doc_id] = max_score
+    # Find document with most chunks
+    if not doc_id_to_chunks:
+        return "I couldn't find relevant information to answer your question."
 
-    sorted_doc_ids = sorted(doc_scores.keys(), key=lambda x: doc_scores[x], reverse=True)
+    best_doc_id = max(doc_id_to_chunks.keys(), key=lambda x: sum(c['score'] for c in doc_id_to_chunks[x]))
+    best_doc_chunks = doc_id_to_chunks[best_doc_id]
 
-    # Prepare context with structured document sections
-    contexts = []
-    current_tokens = 0
+    # Sort best document chunks by score
+    best_doc_chunks.sort(key=lambda x: x['score'], reverse=True)
 
-    for doc_id in sorted_doc_ids:
-        if current_tokens >= max_tokens:
-            break
-
-        chunks = doc_id_to_chunks[doc_id]
-        # Sort chunks by score
-        sorted_chunks = sorted(chunks, key=lambda x: x['score'], reverse=True)
-
-        # Get document metadata from highest scoring chunk
-        metadata = sorted_chunks[0]['metadata']
-        title = metadata.get('title', 'Unknown Document')
-
-        # Combine chunks from this document
-        doc_text = []
-        for chunk in sorted_chunks:
-            chunk_text = chunk['chunk'].strip()
-            chunk_tokens = count_tokens(chunk_text)
-
-            if current_tokens + chunk_tokens <= max_tokens:
-                doc_text.append(chunk_text)
-                current_tokens += chunk_tokens
-            else:
-                # If we can't add the whole chunk, stop adding from this document
-                break
-
-        if doc_text:
-            # Only add section title if multiple documents are included
-            section_header = f"## {title}\n\n" if len(doc_id_to_chunks) > 1 else ""
-            contexts.append(f"{section_header}{process_text_formatting(''.join(doc_text))}")
-
-    context = "\n\n".join(contexts)
+    # Combine chunks from best document into single context
+    context = "\n\n".join([process_text_formatting(chunk['chunk']) for chunk in best_doc_chunks])
 
     # Prepare the prompt for Vertex AI model
     system_prompt = f"""
-    Answer the following question with careful attention to formatting and clarity.
+    Answer the following question with complete, detailed instructions. Focus on providing ALL necessary context.
     Use ONLY the information in the context below.
-    If the context doesn't contain relevant information, say "I don't have specific information on this topic."
+    If the context doesn't contain complete information, acknowledge any gaps rather than skipping details.
 
     CONTEXT:
     {context}
@@ -909,13 +884,15 @@ def extract_answer(query, relevant_chunks, max_tokens=1200):
     QUESTION:
     {query}
 
-    FORMATTING GUIDELINES:
-    1. Maintain proper list formatting and numbering
-    2. Preserve paragraph breaks and headings
-    3. Ensure instructions are complete and clearly presented
-    4. Use markdown formatting for better readability
-    5. Present different sections with clear separation
-    6. Make sure numbered lists have proper indentation and spacing
+    COMPLETENESS GUIDELINES:
+    1. Include ALL steps in any procedure, with no missing actions
+    2. Explain any technical terms, UI elements, or buttons mentioned (e.g., what exact menu to click)
+    3. Make sure instructions can be followed without prior knowledge
+    4. If instructions reference specific values, parameters, or settings, include them exactly
+    5. If different platforms (Android, iOS, etc.) have different instructions, clearly label each set
+    6. Avoid placeholder text like "..." or "[something]" - if you don't have the exact text, say so
+    7. Spell out complete URLs, paths, or commands
+    8. If steps seem ambiguous or incomplete in the source material, note this explicitly
     """
 
     if USE_VERTEX_AI and vertex_ai_available:
@@ -923,14 +900,219 @@ def extract_answer(query, relevant_chunks, max_tokens=1200):
             # Direct call to Vertex AI with focused prompt
             response = vertex_connector.llm.invoke(system_prompt)
             if hasattr(response, 'content'):
-                return response.content.strip()
+                return process_text_formatting(response.content.strip())
             elif isinstance(response, str):
-                return response.strip()
+                return process_text_formatting(response.strip())
         except Exception as e:
             logger.error(f"Error calling Vertex AI directly: {str(e)}")
 
     # If Vertex AI isn't available or fails, use improved fallback
     return process_text_formatting(context)
+
+
+def enhance_context_completeness(chunks, query, max_tokens=1200):
+    """Enhance context by fetching additional chunks to ensure completeness."""
+    enhanced_chunks = list(chunks)  # Start with existing chunks
+
+    # Extract key entities and concepts from query and existing chunks
+    entities = extract_key_entities(query, enhanced_chunks)
+
+    # Track document IDs we already have
+    existing_doc_ids = set(chunk['metadata']['id'] for chunk in enhanced_chunks)
+
+    # For each document we already have, try to get more complete context
+    for doc_id in existing_doc_ids:
+        # Get all chunks from this document, sorted by chunk_index to maintain order
+        doc_chunks = [c for c in enhanced_chunks if c['metadata']['id'] == doc_id]
+        chunk_indices = [c['metadata'].get('chunk_index', 0) for c in doc_chunks]
+
+        # If we have gaps in the indices, try to fill them
+        if len(chunk_indices) > 1:
+            min_idx = min(chunk_indices)
+            max_idx = max(chunk_indices)
+
+            if max_idx - min_idx + 1 > len(chunk_indices):
+                # We have gaps - find missing indices
+                existing_indices = set(chunk_indices)
+                missing_indices = [i for i in range(min_idx, max_idx + 1) if i not in existing_indices]
+
+                logger.info(f"Found {len(missing_indices)} missing chunks in document {doc_id}")
+
+                # Try to fetch missing chunks for better completeness
+                for missing_idx in missing_indices:
+                    # Find chunks with this document ID and chunk index
+                    for i, metadata in enumerate(document_metadata):
+                        if (metadata['id'] == doc_id and
+                                metadata.get('chunk_index', 0) == missing_idx):
+                            # Add this chunk to enhance context
+                            enhanced_chunks.append({
+                                'chunk': document_chunks[i],
+                                'metadata': metadata,
+                                'score': 0.5  # Assign a reasonable score
+                            })
+                            break
+
+    # Check if we need more context for any detected procedures
+    procedure_keywords = ['step', 'guide', 'instruction', 'tutorial', 'how to', 'setup', 'install']
+    is_procedure_query = any(keyword in query.lower() for keyword in procedure_keywords)
+
+    if is_procedure_query:
+        # This is likely asking for a procedure - ensure we have complete steps
+        enhanced_chunks = ensure_complete_procedure(enhanced_chunks, max_tokens)
+
+    # Handle missing context for UI elements and technical terms
+    enhanced_chunks = add_missing_term_definitions(enhanced_chunks, entities, max_tokens)
+
+    return enhanced_chunks
+
+
+def extract_key_entities(query, chunks):
+    """Extract key entities and technical terms from the query and chunks."""
+    # Simple extraction based on capitalized terms and terms in quotes
+    entities = set()
+
+    # Extract capitalized terms and quoted terms from query
+    cap_pattern = r'\b[A-Z][a-zA-Z0-9_]+\b'
+    quote_pattern = r'["\'](.*?)["\']'
+
+    for match in re.finditer(cap_pattern, query):
+        entities.add(match.group(0))
+
+    for match in re.finditer(quote_pattern, query):
+        entities.add(match.group(1))
+
+    # Also extract terms that appear in the chunks
+    for chunk in chunks:
+        for match in re.finditer(cap_pattern, chunk['chunk']):
+            entities.add(match.group(0))
+
+        for match in re.finditer(quote_pattern, chunk['chunk']):
+            entities.add(match.group(1))
+
+    # Add common technical terms that might need explanation
+    tech_terms = ['proxy', 'port', 'IP', 'settings', 'config', 'setup', 'API', 'token', 'auth']
+    for term in tech_terms:
+        if term.lower() in query.lower():
+            entities.add(term)
+
+    return entities
+
+
+def ensure_complete_procedure(chunks, max_tokens):
+    """Ensure procedure steps are complete by checking for numerical sequences."""
+    enhanced_chunks = list(chunks)
+
+    # Group chunks by document ID
+    doc_chunks = {}
+    for chunk in enhanced_chunks:
+        doc_id = chunk['metadata']['id']
+        if doc_id not in doc_chunks:
+            doc_chunks[doc_id] = []
+        doc_chunks[doc_id].append(chunk)
+
+    # For each document, check if we have complete numbered steps
+    for doc_id, chunks in doc_chunks.items():
+        # Extract all numbered steps from chunks
+        step_pattern = r'(?:^|\n)(\s*)(\d+)\.(?:\s+)(.+?)(?:\n|$)'
+        steps = []
+
+        for chunk in chunks:
+            for match in re.finditer(step_pattern, chunk['chunk']):
+                indent, step_num, step_text = match.groups()
+                steps.append((int(step_num), step_text.strip()))
+
+        # Sort steps by number
+        steps.sort(key=lambda x: x[0])
+
+        # Check for missing steps
+        if steps:
+            expected_steps = list(range(1, max(step[0] for step in steps) + 1))
+            existing_steps = [step[0] for step in steps]
+            missing_steps = [step for step in expected_steps if step not in existing_steps]
+
+            if missing_steps:
+                logger.info(f"Found missing steps {missing_steps} in document {doc_id}")
+
+                # If we have missing steps, try to fetch more chunks from this document
+                for i, metadata in enumerate(document_metadata):
+                    if metadata['id'] == doc_id and i < len(document_chunks):
+                        # Check if this chunk has any of the missing steps
+                        chunk_text = document_chunks[i]
+                        has_missing_step = False
+
+                        for step in missing_steps:
+                            step_regex = r'(?:^|\n)\s*' + str(step) + r'\.(?:\s+).+?(?:\n|$)'
+                            if re.search(step_regex, chunk_text):
+                                has_missing_step = True
+                                break
+
+                        if has_missing_step:
+                            # Add this chunk to enhance context
+                            enhanced_chunks.append({
+                                'chunk': chunk_text,
+                                'metadata': metadata,
+                                'score': 0.5  # Assign a reasonable score
+                            })
+
+    return enhanced_chunks
+
+
+def add_missing_term_definitions(chunks, entities, max_tokens):
+    """Add chunks that might define technical terms found in the query and chunks."""
+    enhanced_chunks = list(chunks)
+    current_tokens = sum(count_tokens(chunk['chunk']) for chunk in enhanced_chunks)
+
+    # Track document IDs we already have
+    existing_doc_ids = set(chunk['metadata']['id'] for chunk in enhanced_chunks)
+
+    # For each technical term, try to find definitions
+    for entity in entities:
+        if current_tokens >= max_tokens:
+            break
+
+        # Skip very short terms to avoid noise
+        if len(entity) < 3:
+            continue
+
+        # Create a search pattern for definitions
+        definition_patterns = [
+            rf"\b{re.escape(entity)}\b.*?\bis\b",
+            rf"\b{re.escape(entity)}\b.*?\bmeans\b",
+            rf"\b{re.escape(entity)}\b.*?\brefers to\b",
+            rf"\b{re.escape(entity)}\b.*?:"
+        ]
+
+        # Search through document chunks for definitions
+        for i, chunk_text in enumerate(document_chunks):
+            # Skip chunks from documents we already have
+            if document_metadata[i]['id'] in existing_doc_ids:
+                continue
+
+            # Check if chunk might contain a definition
+            has_definition = False
+            for pattern in definition_patterns:
+                if re.search(pattern, chunk_text, re.IGNORECASE):
+                    has_definition = True
+                    break
+
+            # If term appears multiple times, it might be important context
+            term_count = len(re.findall(rf"\b{re.escape(entity)}\b", chunk_text, re.IGNORECASE))
+            if term_count >= 3:
+                has_definition = True
+
+            if has_definition:
+                # Add this chunk to enhance context
+                enhanced_chunks.append({
+                    'chunk': chunk_text,
+                    'metadata': document_metadata[i],
+                    'score': 0.4  # Slightly lower score for definitions
+                })
+
+                current_tokens += count_tokens(chunk_text)
+                if current_tokens >= max_tokens:
+                    break
+
+    return enhanced_chunks
 
 
 def process_text_formatting(text):
@@ -943,8 +1125,17 @@ def process_text_formatting(text):
     processed_lines = []
     in_list = False
     list_indent = 0
+    current_section = None
 
     for i, line in enumerate(lines):
+        # Check for section headers and maintain them
+        header_match = re.match(r'^(#+)\s+(.+)$', line)
+        if header_match:
+            current_section = line
+            processed_lines.append(line)
+            in_list = False
+            continue
+
         # Check if line is a list item
         list_match = re.match(r'^(\s*)(\d+)\.(\s*)(.+)$', line)
         if list_match:
@@ -956,7 +1147,7 @@ def process_text_formatting(text):
             list_indent = len(spaces)
         elif in_list and line.strip() and i > 0:
             # This might be a continuation of a list item
-            if not lines[i - 1].endswith(('.', ':', '?')) and not line.startswith(' ' * (list_indent + 2)):
+            if not re.search(r'[.:]$', lines[i - 1]) and not line.startswith(' ' * (list_indent + 2)):
                 # Add indentation for continuation text
                 processed_lines.append(' ' * (list_indent + 2) + line)
             else:
@@ -976,14 +1167,30 @@ def process_text_formatting(text):
     # Fix broken links
     processed = re.sub(r'\[([^\]]+)\]\s+\(([^)]+)\)', r'[\1](\2)', processed)
 
+    # Fix incomplete placeholders (empty quotes or brackets)
+    processed = re.sub(r'["\']\s*["\']', '[unknown value]', processed)
+    processed = re.sub(r'\[\s*\]', '[unknown value]', processed)
+
+    # Add clarification for potential UI element abbreviations
+    ui_element_pattern = r'\b([A-Z][A-Z0-9_]{1,5})\b'
+
+    def replace_ui_abbreviation(match):
+        abbr = match.group(1)
+        # Don't replace common acronyms
+        if abbr in ['UI', 'API', 'URL', 'IP', 'ID', 'OS', 'UI', 'PC']:
+            return abbr
+        return f"{abbr} button"  # Assume it's a UI element
+
+    # Find potential UI element abbreviations that might be unclear
+    processed = re.sub(ui_element_pattern, replace_ui_abbreviation, processed)
+
     return processed
 
-
 def _update_vertex_connector_prompt():
-    """Update the Vertex AI prompt template to emphasize better formatting."""
+    """Update the Vertex AI prompt template to emphasize completeness and clarity."""
     if vertex_connector:
         vertex_connector.prompt_template = PromptTemplate(
-            template="""You are a precise knowledge assistant that delivers well-formatted, structured answers based on Confluence documentation.
+            template="""You are a detailed technical guide that provides complete, clear instructions from Confluence documentation.
 
 Context information:
 --------------------------
@@ -992,21 +1199,23 @@ Context information:
 
 Question: {question}
 
-Instructions:
-1. Answer the specific question asked using ONLY information from the context
-2. Present a SINGLE, coherent response that flows naturally
-3. Maintain proper formatting for all lists, steps, and instructions:
-   - Ensure numbered lists have proper spacing and indentation
-   - Preserve paragraph breaks and section headings
-   - Format code snippets, commands, and technical details properly
-4. If a procedure has steps, ensure they are clearly numbered and complete
-5. If multiple procedures exist (e.g., for different platforms), separate them with clear headings
-6. Use consistent terminology throughout your response
-7. Prefer information from a single document when possible for coherence
-8. If the answer isn't in the context, say "I don't have specific information on this topic."
-9. Never reference document names or sources within your answer text
+INSTRUCTIONS:
+1. Answer the question using ONLY information from the context
+2. Provide COMPREHENSIVE, STEP-BY-STEP instructions that leave nothing to interpretation:
+   - Include EVERY step needed to complete the task
+   - When mentioning buttons, menus, or UI elements, describe EXACTLY where they are located
+   - Include all specific values, IP addresses, port numbers, and parameters exactly as given
+   - For each platform (Android, iOS, Windows, etc.), provide the COMPLETE set of instructions
+3. Format your answer professionally:
+   - Use proper numbered lists for steps
+   - Group related steps under clear headings
+   - Maintain consistent indentation and formatting
+4. If specific details are missing from the context, explicitly state what information is unavailable
+5. If steps seem ambiguous in the source material, provide the most likely interpretation and note any uncertainty
+6. Never omit details or use placeholder text (like "..." or "[something]")
+7. Do not reference document names or sources within your answer
 
-Your response should be a polished, properly formatted answer that could appear in an official guide.
+Your response must be a self-contained guide that someone could follow successfully without additional information.
 """,
             input_variables=["context", "question"]
         )
@@ -1522,9 +1731,13 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 def _update_vertex_connector_prompt():
+    """
+    Update the Vertex AI prompt template with advanced instructions to improve response quality.
+    Focuses on formatting, completeness, and coherence.
+    """
     if vertex_connector:
         vertex_connector.prompt_template = PromptTemplate(
-            template="""You are a precise knowledge assistant that delivers focused answers based on Confluence documentation.
+            template="""You are an expert technical documentation writer crafting precise, complete answers from Confluence documentation.
 
 Context information:
 --------------------------
@@ -1533,18 +1746,347 @@ Context information:
 
 Question: {question}
 
-Instructions:
-1. Answer ONLY the specific question asked based on the context provided
-2. Present information from a SINGLE document perspective when possible
-3. Use natural, clear language with a professional tone
-4. Focus only on the most relevant details, omitting tangential information
-5. If multiple documents are referenced in the context, prioritize the one with the most relevant information
-6. If the answer isn't found in the context, say "I don't have specific information on this topic."
-7. Format your response as a cohesive, properly structured answer
-8. Never reference document names or sources within your answer
+I NEED YOU TO FOLLOW THESE INSTRUCTIONS EXACTLY:
 
-Your response should read as a single, authoritative answer from the company's official documentation.
+CONTENT REQUIREMENTS:
+1. Answer using ONLY information from the provided context
+2. Create a SINGLE, UNIFIED response that reads like professional documentation
+3. When describing a process or setup:
+   - Include EVERY required step with correct numbering
+   - Maintain the exact sequence of steps as presented in the context
+   - Preserve all specific values (URLs, IPs, ports, etc.) exactly as given
+   - Include all command line instructions, configuration parameters, and options
+4. If the context contains multiple approaches (e.g., for different platforms):
+   - Clearly separate each approach with descriptive headings
+   - Present each approach in full without mixing steps
+
+FORMATTING REQUIREMENTS:
+1. Use markdown formatting consistently and professionally
+2. Format numbered lists properly:
+   - Ensure proper indentation for multi-line steps
+   - Maintain proper spacing between number and content
+   - Preserve nested lists with correct indentation hierarchy
+3. Use section headings (## and ###) to organize complex answers
+4. Format code blocks, commands, and configuration snippets with proper syntax
+5. Use bold text for UI elements and important terms
+
+CLARITY AND COMPLETENESS:
+1. For UI navigation instructions:
+   - Specify EXACTLY which buttons, menus, or options to click
+   - Describe exactly where to find each UI element
+   - Include any required waiting periods or verification steps
+2. For technical terms and concepts:
+   - Include brief explanations of specialized terminology
+   - Clarify ambiguous terms or abbreviations
+3. For inputs and parameters:
+   - Clearly indicate which fields are required vs. optional
+   - Specify acceptable formats and ranges for inputs
+
+QUALITY CONTROL:
+1. NEVER truncate or abbreviate instructions with "..." or similar
+2. NEVER skip steps or assume prior knowledge
+3. If you detect missing or inconsistent information in the context:
+   - Explicitly note the gap: "Note: The documentation doesn't specify [missing information]"
+   - Provide the most likely interpretation based on context
+4. NEVER reference the source documents or mention Confluence
+
+Your answer should be complete and ready for immediate use without requiring additional information.
 """,
+            input_variables=["context", "question"]
+        )
+
+
+def extract_answer_with_enhanced_prompting(query, relevant_chunks, max_tokens=1200):
+    """
+    Extract an answer with enhanced prompting strategies for Vertex AI.
+    Includes pre-processing context and post-processing responses.
+    """
+    if not relevant_chunks:
+        return "I couldn't find relevant information to answer your question."
+
+    # Pre-process context to improve prompt effectiveness
+    processed_chunks = preprocess_context_for_prompting(relevant_chunks)
+
+    # If Vertex AI integration is enabled and available, use it with enhanced prompting
+    global vertex_connector
+    if USE_VERTEX_AI and vertex_ai_available and vertex_connector:
+        try:
+            logger.info("Using Vertex AI for response generation with enhanced prompting")
+
+            # Apply advanced prompt engineering techniques
+            _update_vertex_connector_prompt()
+
+            # For highly technical or procedural questions, add specific meta-prompts
+            if is_procedural_question(query):
+                add_procedural_meta_instructions()
+            elif is_comparison_question(query):
+                add_comparison_meta_instructions()
+            elif is_troubleshooting_question(query):
+                add_troubleshooting_meta_instructions()
+
+            # Generate the response
+            raw_response = vertex_connector.generate_response(query, processed_chunks)
+
+            # Post-process the response to fix any remaining formatting issues
+            final_response = postprocess_vertex_response(raw_response)
+
+            return final_response
+
+        except Exception as e:
+            logger.error(f"Error using Vertex AI with enhanced prompting: {str(e)}")
+            logger.info("Falling back to standard extraction method")
+
+    # Fallback to standard extraction if Vertex AI isn't available
+    return extract_answer(query, relevant_chunks, max_tokens)
+
+
+def preprocess_context_for_prompting(chunks):
+    """
+    Preprocess context chunks to optimize them for the prompt.
+    Formats the context to emphasize important information and structure.
+    """
+    processed_chunks = []
+
+    # Group chunks by document for coherence
+    doc_id_to_chunks = {}
+    for chunk in chunks:
+        doc_id = chunk['metadata']['id']
+        if doc_id not in doc_id_to_chunks:
+            doc_id_to_chunks[doc_id] = []
+        doc_id_to_chunks[doc_id].append(chunk)
+
+    # Process each document's chunks
+    for doc_id, doc_chunks in doc_id_to_chunks.items():
+        # Sort chunks by relevance score
+        sorted_chunks = sorted(doc_chunks, key=lambda x: x['score'], reverse=True)
+
+        # Get document title from metadata
+        title = sorted_chunks[0]['metadata'].get('title', 'Document')
+
+        # Create a document section with relevant metadata
+        doc_section = {
+            'metadata': sorted_chunks[0]['metadata'].copy(),
+            'chunk': f"## {title}\n\n"
+        }
+
+        # Combine chunks with proper formatting
+        for chunk in sorted_chunks:
+            # Clean up the chunk text
+            chunk_text = process_chunk_for_prompting(chunk['chunk'])
+            doc_section['chunk'] += chunk_text + "\n\n"
+
+        # Add the score from the highest-scoring chunk
+        doc_section['score'] = max(chunk['score'] for chunk in sorted_chunks)
+
+        processed_chunks.append(doc_section)
+
+    # Sort the processed document sections by score
+    return sorted(processed_chunks, key=lambda x: x['score'], reverse=True)
+
+
+def process_chunk_for_prompting(text):
+    """
+    Process a chunk of text to enhance its formatting for prompting.
+    Highlights key elements that should be preserved.
+    """
+    # Highlight code blocks, commands, and technical syntax
+    processed = text
+
+    # Ensure code blocks are properly formatted
+    code_block_pattern = r'```(?:\w+)?\n(.*?)\n```'
+    processed = re.sub(code_block_pattern, r'```\n\1\n```', processed, flags=re.DOTALL)
+
+    # Highlight UI navigation with bold
+    ui_patterns = [
+        (r'click (?:on )?(?:the )?(["\']?(?:[A-Z][a-z]+ )*(?:button|tab|menu|icon|link|option)["\']?)',
+         r'click on the **\1**'),
+        (r'select (?:the )?(["\']?(?:[A-Z][a-z]+ )*(?:option|item|tab|menu)["\']?)', r'select the **\1**'),
+        (r'go to (?:the )?(["\']?(?:[A-Z][a-z]+ )*(?:tab|section|page|screen|menu)["\']?)', r'go to the **\1**')
+    ]
+
+    for pattern, replacement in ui_patterns:
+        processed = re.sub(pattern, replacement, processed, flags=re.IGNORECASE)
+
+    # Ensure proper list formatting
+    lines = processed.split('\n')
+    for i in range(len(lines)):
+        # Fix numbered list items
+        list_match = re.match(r'^(\s*)(\d+)\.(\s*)(.+)$', lines[i])
+        if list_match:
+            spaces, number, existing_space, content = list_match.groups()
+            proper_space = ' ' if not existing_space else existing_space
+            lines[i] = f"{spaces}{number}.{proper_space}{content}"
+
+    return '\n'.join(lines)
+
+
+def postprocess_vertex_response(response):
+    """
+    Post-process the Vertex AI response to fix any remaining formatting issues.
+    """
+    if not response:
+        return "I couldn't generate a proper response based on the available information."
+
+    # Fix list formatting issues
+    processed = process_text_formatting(response)
+
+    # Ensure headings have proper spacing
+    processed = re.sub(r'(?<!\n)\n(#+\s+)', r'\n\n\1', processed)
+    processed = re.sub(r'(#+\s+.+)\n(?!\n)', r'\1\n\n', processed)
+
+    # Fix any broken markdown links
+    processed = re.sub(r'\[([^\]]+)\]\s+\(([^)]+)\)', r'[\1](\2)', processed)
+
+    # Fix code block formatting
+    processed = re.sub(r'```\s+([a-zA-Z0-9]+)', r'```\1', processed)
+
+    # Final check for overall structure
+    if not re.search(r'^\s*#+\s+', processed) and len(processed.split('\n\n')) > 3:
+        # Long response without headings - add a title based on the question
+        processed = f"# Response\n\n{processed}"
+
+    return processed
+
+
+def is_procedural_question(query):
+    """Check if the query is asking for a procedure or how-to."""
+    procedural_patterns = [
+        r'how\s+to\s+',
+        r'steps?\s+to\s+',
+        r'guide\s+for\s+',
+        r'process\s+for\s+',
+        r'instructions?\s+for\s+',
+        r'set\s*up',
+        r'configure',
+        r'install',
+        r'implement'
+    ]
+
+    return any(re.search(pattern, query, re.IGNORECASE) for pattern in procedural_patterns)
+
+
+def is_comparison_question(query):
+    """Check if the query is asking for a comparison."""
+    comparison_patterns = [
+        r'compare',
+        r'difference\s+between',
+        r'vs\.?',
+        r'versus',
+        r'similarities',
+        r'pros\s+and\s+cons'
+    ]
+
+    return any(re.search(pattern, query, re.IGNORECASE) for pattern in comparison_patterns)
+
+
+def is_troubleshooting_question(query):
+    """Check if the query is about troubleshooting or error resolution."""
+    troubleshooting_patterns = [
+        r'troubleshoot',
+        r'debug',
+        r'fix',
+        r'solve',
+        r'resolve',
+        r'error',
+        r'issue',
+        r'problem',
+        r'not\s+working',
+        r'fails?',
+        r'broken'
+    ]
+
+    return any(re.search(pattern, query, re.IGNORECASE) for pattern in troubleshooting_patterns)
+
+
+def add_procedural_meta_instructions():
+    """Add meta-instructions optimized for procedural questions."""
+    if vertex_connector:
+        current_template = vertex_connector.prompt_template.template
+
+        procedural_instructions = """
+PROCEDURAL RESPONSE REQUIREMENTS:
+1. Format the response as a clear step-by-step guide
+2. Number all steps sequentially and consistently
+3. For each step:
+   - Begin with a specific action verb (Click, Enter, Navigate, etc.)
+   - Include only ONE primary action per numbered step
+   - Add substeps with bullets for related actions within a step
+4. Include setup prerequisites before the main steps
+5. Add verification steps after critical actions
+6. End with a "Verification" section explaining how to confirm success
+"""
+
+        # Insert procedural instructions before "Your answer should be"
+        updated_template = current_template.replace(
+            "Your answer should be complete and ready",
+            f"{procedural_instructions}\n\nYour answer should be complete and ready"
+        )
+
+        vertex_connector.prompt_template = PromptTemplate(
+            template=updated_template,
+            input_variables=["context", "question"]
+        )
+
+
+def add_comparison_meta_instructions():
+    """Add meta-instructions optimized for comparison questions."""
+    if vertex_connector:
+        current_template = vertex_connector.prompt_template.template
+
+        comparison_instructions = """
+COMPARISON RESPONSE REQUIREMENTS:
+1. Structure the response with clear categories for comparison
+2. Use a consistent format throughout (either feature-by-feature OR option-by-option)
+3. Include a brief introduction explaining what's being compared
+4. For feature-by-feature comparison:
+   - Use level 2 headings (##) for each feature category
+   - Describe how each option implements that feature
+5. For option-by-option comparison:
+   - Use level 2 headings (##) for each option
+   - List the key features and characteristics under each
+6. Use tables for side-by-side comparisons when appropriate
+7. End with a "Summary" section highlighting key differences
+"""
+
+        # Insert comparison instructions before "Your answer should be"
+        updated_template = current_template.replace(
+            "Your answer should be complete and ready",
+            f"{comparison_instructions}\n\nYour answer should be complete and ready"
+        )
+
+        vertex_connector.prompt_template = PromptTemplate(
+            template=updated_template,
+            input_variables=["context", "question"]
+        )
+
+
+def add_troubleshooting_meta_instructions():
+    """Add meta-instructions optimized for troubleshooting questions."""
+    if vertex_connector:
+        current_template = vertex_connector.prompt_template.template
+
+        troubleshooting_instructions = """
+TROUBLESHOOTING RESPONSE REQUIREMENTS:
+1. Begin with a brief description of the issue being addressed
+2. Structure the response in a diagnostic approach:
+   - Start with common/simple solutions before complex ones
+   - Group related troubleshooting steps under clear headings
+3. For each troubleshooting step:
+   - Explain what the step addresses and why it might solve the issue
+   - Provide specific actions with exact commands or UI paths
+   - Include how to verify if the step resolved the issue
+4. Add indicators of problem severity or solution complexity when available
+5. End with a "Prevention" section with tips to avoid future occurrences
+"""
+
+        # Insert troubleshooting instructions before "Your answer should be"
+        updated_template = current_template.replace(
+            "Your answer should be complete and ready",
+            f"{troubleshooting_instructions}\n\nYour answer should be complete and ready"
+        )
+
+        vertex_connector.prompt_template = PromptTemplate(
+            template=updated_template,
             input_variables=["context", "question"]
         )
 
