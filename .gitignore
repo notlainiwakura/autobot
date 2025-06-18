@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Caches and data
+cache/
+
+# Environment variables and secrets
+.env
+
+# macOS system files
+.DS_Store
+
+# IDE files
+.idea/
+
+# Log files
+*.log
+
+# Example env file (keep for reference, not ignored)
+!env-file-example.txt 
